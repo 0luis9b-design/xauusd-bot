@@ -214,17 +214,32 @@ def check_trade(price):
 # ── PREIS ABRUFEN ────────────────────────────
 def fetch_price():
     import urllib.request
-    try:
-        url="https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF?interval=1m&range=1d"
-        req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
-        with urllib.request.urlopen(req,timeout=10) as r:
-            data=json.loads(r.read())
-            return float(data["chart"]["result"][0]["meta"]["regularMarketPrice"])
-    except Exception as e:
-        add_log(f"Preis-Fehler: {e}","WARN")
-        if bot_state["prices"]:
-            import random
-            return round(bot_state["prices"][-1]+random.uniform(-0.3,0.3),2)
+
+    # Quelle 1: Yahoo Finance XAUUSD Spot
+    sources = [
+        "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD%3DX?interval=1m&range=1d",
+        "https://query2.finance.yahoo.com/v8/finance/chart/XAUUSD%3DX?interval=1m&range=1d",
+        "https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF?interval=1m&range=1d",
+    ]
+    for url in sources:
+        try:
+            req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
+            with urllib.request.urlopen(req,timeout=8) as r:
+                data=json.loads(r.read())
+                price=float(data["chart"]["result"][0]["meta"]["regularMarketPrice"])
+                # Plausibilitätsprüfung: XAUUSD sollte zwischen 1500 und 5000 liegen
+                if 1500 < price < 5000:
+                    return price
+                else:
+                    add_log(f"Preis {price} außerhalb Bereich — versuche nächste Quelle","WARN")
+        except Exception as e:
+            add_log(f"Preis-Quelle fehlgeschlagen: {e}","WARN")
+            continue
+
+    # Fallback: letzter bekannter Preis
+    if bot_state["prices"]:
+        import random
+        return round(bot_state["prices"][-1]+random.uniform(-0.3,0.3),2)
     return None
 
 # ── ANALYSE LOOP ─────────────────────────────
