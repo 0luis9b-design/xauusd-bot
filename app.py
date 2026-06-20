@@ -31,6 +31,22 @@ bot_state = {
     "running":False,"log":[],
     "trades":[],"open_trade":None,
     "willy_signals":[],"willy_last":None,
+    # ─── WillyAlgoTrader Analyse & Win-Rate Tracking ───
+    "willy_analytics":{
+        "open_signals":[],       # Offene Signale (warten auf Ergebnis)
+        "closed_signals":[],     # Abgeschlossene Signale (max 500)
+        "by_direction":{         # Win-Rate nach Richtung
+            "BUY": {"count":0,"wins":0,"losses":0,"pending":0,"win_rate":0.0,"tp1":0,"tp2":0,"tp3":0},
+            "SELL":{"count":0,"wins":0,"losses":0,"pending":0,"win_rate":0.0,"tp1":0,"tp2":0,"tp3":0},
+        },
+        "by_tf":{},              # Win-Rate nach Timeframe: {"15m":{count,wins,...}}
+        "by_score":{},           # Win-Rate nach Score-Qualität
+        "total":0,"wins":0,"losses":0,"pending":0,
+        "overall_win_rate":0.0,
+        "tp1_hits":0,"tp2_hits":0,"tp3_hits":0,"sl_hits":0,
+        "avg_pips_win":0.0,"avg_pips_loss":0.0,
+        "best_signal_type":"—","worst_signal_type":"—",
+    },
     "learning":{
         "total":0,"wins":0,"accuracy":0.0,"cycle":0,
         "mistakes":[],"rules":[],"avoided_trades":0,"confirmation_failures":[],
@@ -819,6 +835,207 @@ def check_trade(price):
 # ═══════════════════════════════════════════════════════
 # HAUPTLOOP
 # ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
+# WILLYALGOTRADER — Signal-Tracking & Win-Rate Analyse
+# ═══════════════════════════════════════════════════════
+import uuid as _uuid
+
+def _willy_direction(sig_type):
+    """Erkennt ob ein Signal BUY, SELL oder ein TP/SL-Event ist."""
+    s=sig_type.upper()
+    if any(x in s for x in ["TP1","TP2","TP3","TP_1","TP_2","TP_3","TARGET"]): return "TP"
+    if any(x in s for x in ["SL","STOP","STOPLOSS","LOSS_HIT"]): return "SL"
+    if any(x in s for x in ["BUY","LONG","BULLISH"]): return "BUY"
+    if any(x in s for x in ["SELL","SHORT","BEARISH"]): return "SELL"
+    return None
+
+def _willy_tp_level(sig_type):
+    s=sig_type.upper()
+    if "TP3" in s or "TP_3" in s or "TARGET3" in s: return 3
+    if "TP2" in s or "TP_2" in s or "TARGET2" in s: return 2
+    if "TP1" in s or "TP_1" in s or "TARGET1" in s: return 1
+    return None
+
+def _willy_score(sig_type):
+    s=sig_type.upper()
+    if "A+" in s or "APLUS" in s or "A_PLUS" in s or "SCORE_A" in s: return "A+"
+    if "A"  in s and "B" not in s: return "A"
+    if "B+" in s: return "B+"
+    if "B"  in s: return "B"
+    if "C"  in s: return "C"
+    return "—"
+
+def process_willy_signal(data):
+    """Verarbeitet eingehende WillyAlgoTrader Webhooks komplett."""
+    wa=bot_state["willy_analytics"]
+    sig_type=data.get("signal","").upper()
+    tf=data.get("timeframe","—")
+    score=str(data.get("score","—"))
+    pr=data.get("price") or data.get("close") or bot_state.get("price")
+    try: entry_price=float(str(pr).replace(",",".")) if pr else None
+    except: entry_price=None
+    def _safe(v):
+        try: return float(str(v).replace(",",".")) if v else None
+        except: return None
+    tp1=_safe(data.get("tp1")); tp2=_safe(data.get("tp2"))
+    tp3=_safe(data.get("tp3")); sl=_safe(data.get("sl"))
+    direction=_willy_direction(sig_type)
+    tp_level=_willy_tp_level(sig_type)
+    score_clean=_willy_score(sig_type)
+    now_str=datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── TP-Hit: offene Signale auflösen ──
+    if direction=="TP" and tp_level:
+        wa["tp1_hits" if tp_level==1 else "tp2_hits" if tp_level==2 else "tp3_hits"]+=1
+        resolved=False
+        for sig in wa["open_signals"]:
+            if sig["status"]=="PENDING":
+                sig["status"]=f"WIN_TP{tp_level}"
+                sig["result"]="WIN"; sig["tp_level_hit"]=tp_level
+                sig["close_time"]=now_str; sig["close_price"]=entry_price
+                if entry_price and sig.get("entry"):
+                    pts=abs(entry_price-sig["entry"])
+                    sig["pips"]=round(pts,2)
+                    wa["avg_pips_win"]=round((wa["avg_pips_win"]*wa["wins"]+pts)/(wa["wins"]+1),2)
+                _close_willy_signal(sig,"WIN",tp_level)
+                resolved=True; break
+        if resolved: _recalc_willy_stats()
+        return
+
+    # ── SL-Hit: offene Signale als Verlust schließen ──
+    if direction=="SL":
+        wa["sl_hits"]+=1
+        for sig in wa["open_signals"]:
+            if sig["status"]=="PENDING":
+                sig["status"]="LOSS_SL"; sig["result"]="LOSS"
+                sig["close_time"]=now_str; sig["close_price"]=entry_price
+                if entry_price and sig.get("entry"):
+                    pts=abs(entry_price-sig["entry"])
+                    sig["pips"]=-round(pts,2)
+                    wa["avg_pips_loss"]=round((wa["avg_pips_loss"]*wa["losses"]+pts)/(wa["losses"]+1),2)
+                _close_willy_signal(sig,"LOSS",None)
+                break
+        _recalc_willy_stats(); return
+
+    # ── Neues BUY/SELL-Signal ──
+    if direction in ["BUY","SELL"]:
+        sig_id=str(_uuid.uuid4())[:8]
+        new_sig={
+            "id":sig_id,"signal_type":sig_type,"direction":direction,
+            "timeframe":tf,"score":score_clean,"raw_score":score,
+            "entry":entry_price,"tp1":tp1,"tp2":tp2,"tp3":tp3,"sl":sl,
+            "open_time":now_str,"close_time":None,"close_price":None,
+            "status":"PENDING","result":None,"tp_level_hit":None,"pips":None,
+        }
+        wa["open_signals"].insert(0,new_sig)
+        if len(wa["open_signals"])>50: wa["open_signals"].pop()
+        wa["total"]+=1; wa["pending"]+=1
+        # By-Direction zählen
+        dk=wa["by_direction"].get(direction,{"count":0,"wins":0,"losses":0,"pending":0,"win_rate":0.0,"tp1":0,"tp2":0,"tp3":0})
+        dk["count"]+=1; dk["pending"]+=1; wa["by_direction"][direction]=dk
+        # By-TF zählen
+        if tf not in wa["by_tf"]: wa["by_tf"][tf]={"count":0,"wins":0,"losses":0,"pending":0,"win_rate":0.0,"tp1":0,"tp2":0,"tp3":0}
+        wa["by_tf"][tf]["count"]+=1; wa["by_tf"][tf]["pending"]+=1
+        # By-Score zählen
+        if score_clean not in wa["by_score"]: wa["by_score"][score_clean]={"count":0,"wins":0,"losses":0,"pending":0,"win_rate":0.0}
+        wa["by_score"][score_clean]["count"]+=1; wa["by_score"][score_clean]["pending"]+=1
+        add_log(f"⭐ Willy {direction} [{tf}] Score:{score_clean} @ {entry_price} | TP1:{tp1} SL:{sl}","SIGNAL")
+        _recalc_willy_stats()
+
+def _close_willy_signal(sig,result,tp_level):
+    """Bewegt Signal von open in closed, aktualisiert Statistiken."""
+    wa=bot_state["willy_analytics"]
+    wa["open_signals"]=[s for s in wa["open_signals"] if s["id"]!=sig["id"]]
+    wa["closed_signals"].insert(0,sig)
+    if len(wa["closed_signals"])>500: wa["closed_signals"].pop()
+    wa["pending"]=max(0,wa["pending"]-1)
+    if result=="WIN":
+        wa["wins"]+=1
+        d=wa["by_direction"].get(sig["direction"],{})
+        d["wins"]=d.get("wins",0)+1; d["pending"]=max(0,d.get("pending",0)-1)
+        if tp_level: d[f"tp{tp_level}"]=d.get(f"tp{tp_level}",0)+1
+        tf=sig.get("timeframe","—"); sc=sig.get("score","—")
+        if tf in wa["by_tf"]:
+            wa["by_tf"][tf]["wins"]+=1; wa["by_tf"][tf]["pending"]=max(0,wa["by_tf"][tf]["pending"]-1)
+            if tp_level: wa["by_tf"][tf][f"tp{tp_level}"]=wa["by_tf"][tf].get(f"tp{tp_level}",0)+1
+        if sc in wa["by_score"]:
+            wa["by_score"][sc]["wins"]+=1; wa["by_score"][sc]["pending"]=max(0,wa["by_score"][sc]["pending"]-1)
+    else:
+        wa["losses"]+=1
+        d=wa["by_direction"].get(sig["direction"],{})
+        d["losses"]=d.get("losses",0)+1; d["pending"]=max(0,d.get("pending",0)-1)
+        tf=sig.get("timeframe","—"); sc=sig.get("score","—")
+        if tf in wa["by_tf"]:
+            wa["by_tf"][tf]["losses"]+=1; wa["by_tf"][tf]["pending"]=max(0,wa["by_tf"][tf]["pending"]-1)
+        if sc in wa["by_score"]:
+            wa["by_score"][sc]["losses"]+=1; wa["by_score"][sc]["pending"]=max(0,wa["by_score"][sc]["pending"]-1)
+
+def _recalc_willy_stats():
+    """Berechnet alle Win-Rates neu."""
+    wa=bot_state["willy_analytics"]
+    resolved=wa["wins"]+wa["losses"]
+    wa["overall_win_rate"]=round(wa["wins"]/resolved*100,1) if resolved else 0.0
+    for d in list(wa["by_direction"].values()):
+        r=d.get("wins",0)+d.get("losses",0)
+        d["win_rate"]=round(d.get("wins",0)/r*100,1) if r else 0.0
+    for d in list(wa["by_tf"].values()):
+        r=d.get("wins",0)+d.get("losses",0)
+        d["win_rate"]=round(d.get("wins",0)/r*100,1) if r else 0.0
+    for d in list(wa["by_score"].values()):
+        r=d.get("wins",0)+d.get("losses",0)
+        d["win_rate"]=round(d.get("wins",0)/r*100,1) if r else 0.0
+    # Bestes/schlechtestes Signal
+    if wa["by_score"]:
+        scored={k:v for k,v in wa["by_score"].items() if (v.get("wins",0)+v.get("losses",0))>0}
+        if scored:
+            wa["best_signal_type"]=max(scored,key=lambda k:scored[k]["win_rate"])
+            wa["worst_signal_type"]=min(scored,key=lambda k:scored[k]["win_rate"])
+
+def check_willy_open_signals(price):
+    """Prüft offene Willy-Signale gegen den aktuellen Preis auf TP/SL."""
+    wa=bot_state["willy_analytics"]
+    now=datetime.datetime.utcnow()
+    to_close=[]
+    for sig in wa["open_signals"]:
+        if sig["status"]!="PENDING": continue
+        try:
+            ot=datetime.datetime.strptime(sig["open_time"],"%Y-%m-%d %H:%M:%S")
+            age_h=(now-ot).total_seconds()/3600
+        except: age_h=0
+        entry=sig.get("entry"); tp1=sig.get("tp1"); tp2=sig.get("tp2"); tp3=sig.get("tp3"); sl=sig.get("sl")
+        if not entry: continue
+        result=None; tp_level=None; close_price=price
+        if sig["direction"]=="BUY":
+            if sl and price<=sl: result="LOSS"
+            elif tp3 and price>=tp3: result="WIN"; tp_level=3
+            elif tp2 and price>=tp2: result="WIN"; tp_level=2
+            elif tp1 and price>=tp1: result="WIN"; tp_level=1
+        elif sig["direction"]=="SELL":
+            if sl and price>=sl: result="LOSS"
+            elif tp3 and price<=tp3: result="WIN"; tp_level=3
+            elif tp2 and price<=tp2: result="WIN"; tp_level=2
+            elif tp1 and price<=tp1: result="WIN"; tp_level=1
+        # Auto-expire nach 48h ohne Ergebnis
+        if not result and age_h>48: result="EXPIRED"; sig["status"]="EXPIRED"
+        if result and result!="EXPIRED":
+            sig["status"]=f"WIN_TP{tp_level}" if result=="WIN" else "LOSS_SL"
+            sig["result"]=result; sig["tp_level_hit"]=tp_level
+            sig["close_time"]=now.strftime("%Y-%m-%d %H:%M:%S"); sig["close_price"]=close_price
+            pips=abs(close_price-entry)
+            sig["pips"]=round(pips,2) if result=="WIN" else -round(pips,2)
+            if result=="WIN" and tp_level:
+                wa[f"tp{tp_level}_hits"]+=1
+            else:
+                wa["sl_hits"]+=1
+            to_close.append((sig,result,tp_level))
+        elif result=="EXPIRED":
+            to_close.append((sig,"LOSS",None))
+    for sig,res,tp in to_close:
+        _close_willy_signal(sig,res,tp)
+    if to_close:
+        _recalc_willy_stats()
+        add_log(f"Willy: {len(to_close)} Signal(e) automatisch aufgelöst","INFO")
+
 def analysis_loop():
     add_log("XAUUSD KI-Bot v4.0 — 4 Strategien, Macro-Analyse, Guardrails, Tab-Dashboard","INFO")
     cycle=0; c_cycle=0; i_cycle=0; w_cycle=0
@@ -849,6 +1066,7 @@ def analysis_loop():
                 if len(bot_state["prices"])>500: bot_state["prices"].pop(0)
                 bot_state["last_update"]=datetime.datetime.utcnow().strftime("%H:%M:%S UTC")
                 check_trade(price)
+                check_willy_open_signals(price)
                 if len(bot_state["prices"])>=30:
                     c1h=bot_state["candles"].get("1h",[])
                     inds=build_indicators(bot_state["prices"],c1h); bot_state["indicators"]=inds
@@ -1022,6 +1240,7 @@ td{padding:7px 8px;border-bottom:1px solid #0d1420;font-variant-numeric:tabular-
   <button class="tab tab-tf"        onclick="showTab('t-tf',this)">🟢 Trend Follow</button>
   <button class="tab tab-bo"        onclick="showTab('t-bo',this)">🟡 Breakout</button>
   <button class="tab tab-ms"        onclick="showTab('t-ms',this)">🟣 Macro Struktur</button>
+  <button class="tab"               onclick="showTab('t-willy',this)" style="border-color:#f59e0b">⭐ WillyAlgoTrader</button>
   <button class="tab tab-st"        onclick="showTab('t-stats',this)">📈 Statistiken</button>
 </div>
 
@@ -1323,7 +1542,138 @@ td{padding:7px 8px;border-bottom:1px solid #0d1420;font-variant-numeric:tabular-
 </div><!-- /t-ms -->
 
 <!-- ══════════════════════════════════════
-     TAB 6: STATISTIKEN
+     TAB: WILLYALGOTRADER
+══════════════════════════════════════ -->
+<div id="t-willy" class="tc">
+<div class="sec">⭐ WillyAlgoTrader — Signal-Analyse &amp; Win-Rate Tracking</div>
+
+<!-- Gesamt-Stats -->
+<div class="g5" style="margin-bottom:12px">
+  <div class="dk">
+    <div class="lbl">Gesamt-Signale</div>
+    <div class="dv amr" id="wa-total">0</div>
+  </div>
+  <div class="dk">
+    <div class="lbl">Win-Rate (gesamt)</div>
+    <div class="dv" id="wa-wr">—</div>
+  </div>
+  <div class="dk">
+    <div class="lbl">Gewonnen / Verloren</div>
+    <div class="dv" id="wa-wl">0 / 0</div>
+  </div>
+  <div class="dk">
+    <div class="lbl">Noch offen</div>
+    <div class="dv amr" id="wa-pending">0</div>
+  </div>
+  <div class="dk">
+    <div class="lbl">Bestes Signal</div>
+    <div class="dv pur" id="wa-best">—</div>
+  </div>
+</div>
+
+<!-- TP/SL Distribution -->
+<div class="pn" style="margin-bottom:12px">
+  <div class="pt"><span class="dot da"></span>TP/SL Verteilung — Wie weit läuft der Trade?</div>
+  <div class="g4" style="margin-bottom:0">
+    <div class="sm">
+      <div class="lbl" style="color:var(--gr)">TP1 HITS</div>
+      <div class="sv pos" id="wa-tp1">0</div>
+      <div class="pb"><div class="pf pg" id="wa-tp1-bar" style="width:0%"></div></div>
+    </div>
+    <div class="sm">
+      <div class="lbl" style="color:var(--gr)">TP2 HITS</div>
+      <div class="sv pos" id="wa-tp2">0</div>
+      <div class="pb"><div class="pf pg" id="wa-tp2-bar" style="width:0%"></div></div>
+    </div>
+    <div class="sm">
+      <div class="lbl" style="color:var(--gr)">TP3 HITS</div>
+      <div class="sv pos" id="wa-tp3">0</div>
+      <div class="pb"><div class="pf pg" id="wa-tp3-bar" style="width:0%"></div></div>
+    </div>
+    <div class="sm">
+      <div class="lbl" style="color:var(--rd)">SL HITS</div>
+      <div class="sv neg" id="wa-sl">0</div>
+      <div class="pb"><div class="pf pr" id="wa-sl-bar" style="width:0%"></div></div>
+    </div>
+  </div>
+</div>
+
+<!-- BUY vs SELL Win-Rate -->
+<div class="g2" style="margin-bottom:12px">
+  <div class="pn">
+    <div class="pt"><span class="dot dg"></span>BUY-Signale Win-Rate</div>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+      <div class="big pos" id="wa-buy-wr">—</div>
+      <div>
+        <div class="meta">Signale: <b id="wa-buy-count">0</b></div>
+        <div class="meta">Gewonnen: <b id="wa-buy-wins" class="pos">0</b> · Verloren: <b id="wa-buy-losses" class="neg">0</b></div>
+      </div>
+    </div>
+    <div class="pb"><div class="pf pg" id="wa-buy-bar" style="width:0%"></div></div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:10px;font-size:12px;text-align:center">
+      <div><div class="lbl">TP1</div><b class="pos" id="wa-buy-tp1">0</b></div>
+      <div><div class="lbl">TP2</div><b class="pos" id="wa-buy-tp2">0</b></div>
+      <div><div class="lbl">TP3</div><b class="pos" id="wa-buy-tp3">0</b></div>
+    </div>
+  </div>
+  <div class="pn">
+    <div class="pt"><span class="dot" style="background:var(--rd)"></span>SELL-Signale Win-Rate</div>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+      <div class="big neg" id="wa-sell-wr">—</div>
+      <div>
+        <div class="meta">Signale: <b id="wa-sell-count">0</b></div>
+        <div class="meta">Gewonnen: <b id="wa-sell-wins" class="pos">0</b> · Verloren: <b id="wa-sell-losses" class="neg">0</b></div>
+      </div>
+    </div>
+    <div class="pb"><div class="pf pr" id="wa-sell-bar" style="width:0%"></div></div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:10px;font-size:12px;text-align:center">
+      <div><div class="lbl">TP1</div><b class="pos" id="wa-sell-tp1">0</b></div>
+      <div><div class="lbl">TP2</div><b class="pos" id="wa-sell-tp2">0</b></div>
+      <div><div class="lbl">TP3</div><b class="pos" id="wa-sell-tp3">0</b></div>
+    </div>
+  </div>
+</div>
+
+<!-- Win-Rate nach Timeframe & Score -->
+<div class="g2" style="margin-bottom:12px">
+  <div class="pn">
+    <div class="pt"><span class="dot db"></span>Win-Rate nach Timeframe</div>
+    <div id="wa-by-tf" style="font-size:13px;line-height:2">
+      <span style="color:var(--ft)">Noch keine Daten — warte auf Signale</span>
+    </div>
+  </div>
+  <div class="pn">
+    <div class="pt"><span class="dot dp"></span>Win-Rate nach Score/Qualität</div>
+    <div id="wa-by-score" style="font-size:13px;line-height:2">
+      <span style="color:var(--ft)">Noch keine Daten</span>
+    </div>
+  </div>
+</div>
+
+<!-- Offene Signale -->
+<div class="pn" style="margin-bottom:12px">
+  <div class="pt"><span class="dot da pulse"></span>Offene Signale — warten auf TP/SL</div>
+  <div id="wa-open" style="font-size:13px;color:var(--dm);line-height:2">Keine offenen Signale</div>
+</div>
+
+<!-- Letzte abgeschlossene Signale -->
+<div class="pn">
+  <div class="pt"><span class="dot db"></span>Letzte abgeschlossene Signale</div>
+  <div class="tw" style="max-height:260px;overflow-y:auto">
+  <table>
+    <thead><tr>
+      <th>Zeit</th><th>Richtung</th><th>TF</th><th>Score</th>
+      <th>Entry</th><th>TP1</th><th>TP2</th><th>SL</th>
+      <th>Close</th><th>Pips</th><th>TP Hit</th><th>Ergebnis</th>
+    </tr></thead>
+    <tbody id="wa-history"><tr><td colspan="12" style="text-align:center;padding:10px;color:var(--ft)">Noch keine abgeschlossenen Signale</td></tr></tbody>
+  </table>
+  </div>
+</div>
+</div><!-- /t-willy -->
+
+<!-- ══════════════════════════════════════
+     TAB: STATISTIKEN
 ══════════════════════════════════════ -->
 <div id="t-stats" class="tc">
 <div class="sec">Performance-Metriken (Spec 6.1)</div>
@@ -1568,6 +1918,107 @@ async function refresh(){
     document.getElementById('bar-bo').style.width=Math.min((ss.breakout||0)/mx*100,100)+'%';
     document.getElementById('bar-ms').style.width=Math.min((ss.macro_structure||0)/mx*100,100)+'%';
 
+    // ── TAB: WILLYALGOTRADER ──
+    const wa=d.willy_analytics||{};
+    const waTotal=wa.total||0,waWins=wa.wins||0,waLosses=wa.losses||0;
+    document.getElementById('wa-total').textContent=waTotal;
+    const waWrEl=document.getElementById('wa-wr');
+    waWrEl.textContent=wa.overall_win_rate?wa.overall_win_rate+'%':'—';
+    waWrEl.className='dv '+(wa.overall_win_rate>=55?'pos':wa.overall_win_rate>=45?'amr':'neg');
+    document.getElementById('wa-wl').textContent=waWins+' / '+waLosses;
+    document.getElementById('wa-wl').className='dv '+(waWins>waLosses?'pos':waWins<waLosses?'neg':'neu');
+    document.getElementById('wa-pending').textContent=wa.pending||0;
+    document.getElementById('wa-best').textContent=wa.best_signal_type||'—';
+    // TP/SL Distribution
+    const tp1h=wa.tp1_hits||0,tp2h=wa.tp2_hits||0,tp3h=wa.tp3_hits||0,slh=wa.sl_hits||0;
+    const tpMax=Math.max(tp1h,tp2h,tp3h,slh,1);
+    document.getElementById('wa-tp1').textContent=tp1h;
+    document.getElementById('wa-tp2').textContent=tp2h;
+    document.getElementById('wa-tp3').textContent=tp3h;
+    document.getElementById('wa-sl').textContent=slh;
+    document.getElementById('wa-tp1-bar').style.width=Math.min(tp1h/tpMax*100,100)+'%';
+    document.getElementById('wa-tp2-bar').style.width=Math.min(tp2h/tpMax*100,100)+'%';
+    document.getElementById('wa-tp3-bar').style.width=Math.min(tp3h/tpMax*100,100)+'%';
+    document.getElementById('wa-sl-bar').style.width=Math.min(slh/tpMax*100,100)+'%';
+    // BUY/SELL
+    const buyD=(wa.by_direction||{}).BUY||{};
+    const sellD=(wa.by_direction||{}).SELL||{};
+    document.getElementById('wa-buy-wr').textContent=buyD.win_rate?buyD.win_rate+'%':'—';
+    document.getElementById('wa-buy-count').textContent=buyD.count||0;
+    document.getElementById('wa-buy-wins').textContent=buyD.wins||0;
+    document.getElementById('wa-buy-losses').textContent=buyD.losses||0;
+    document.getElementById('wa-buy-bar').style.width=(buyD.win_rate||0)+'%';
+    document.getElementById('wa-buy-tp1').textContent=buyD.tp1||0;
+    document.getElementById('wa-buy-tp2').textContent=buyD.tp2||0;
+    document.getElementById('wa-buy-tp3').textContent=buyD.tp3||0;
+    document.getElementById('wa-sell-wr').textContent=sellD.win_rate?sellD.win_rate+'%':'—';
+    document.getElementById('wa-sell-count').textContent=sellD.count||0;
+    document.getElementById('wa-sell-wins').textContent=sellD.wins||0;
+    document.getElementById('wa-sell-losses').textContent=sellD.losses||0;
+    document.getElementById('wa-sell-bar').style.width=(sellD.win_rate||0)+'%';
+    document.getElementById('wa-sell-tp1').textContent=sellD.tp1||0;
+    document.getElementById('wa-sell-tp2').textContent=sellD.tp2||0;
+    document.getElementById('wa-sell-tp3').textContent=sellD.tp3||0;
+    // By TF
+    const byTf=wa.by_tf||{};
+    document.getElementById('wa-by-tf').innerHTML=Object.keys(byTf).length
+      ?Object.entries(byTf).sort((a,b)=>b[1].count-a[1].count).map(([tf2,v])=>{
+        const r=v.wins+v.losses; const wr=r>0?v.win_rate:null;
+        return `<div class="row" style="padding:5px 0">
+          <span class="rk" style="font-size:13px;font-weight:700">${tf2}</span>
+          <span>
+            <span class="${wr>=55?'pos':wr>=45?'amr':'neg'}" style="font-size:15px;font-weight:700">${wr!==null?wr+'%':'—'}</span>
+            <span class="meta" style="display:inline;margin-left:8px">${v.wins}W / ${v.losses}L / ${v.pending}⏳ (${v.count} total)</span>
+            ${v.tp1?`<span class="cfp" style="margin-left:4px">TP1:${v.tp1}</span>`:''}
+            ${v.tp2?`<span class="cfp">TP2:${v.tp2}</span>`:''}
+            ${v.tp3?`<span class="cfp">TP3:${v.tp3}</span>`:''}
+          </span>
+        </div>`;}).join('')
+      :'<span style="color:var(--ft)">Noch keine Daten</span>';
+    // By Score
+    const byScore=wa.by_score||{};
+    document.getElementById('wa-by-score').innerHTML=Object.keys(byScore).length
+      ?Object.entries(byScore).sort((a,b)=>b[1].count-a[1].count).map(([sc,v])=>{
+        const r=v.wins+v.losses; const wr=r>0?v.win_rate:null;
+        return `<div class="row" style="padding:5px 0">
+          <span class="rk" style="font-size:13px;font-weight:700">Score: ${sc}</span>
+          <span>
+            <span class="${wr>=55?'pos':wr>=45?'amr':'neg'}" style="font-size:15px;font-weight:700">${wr!==null?wr+'%':'—'}</span>
+            <span class="meta" style="display:inline;margin-left:8px">${v.wins}W / ${v.losses}L / ${v.pending}⏳</span>
+          </span>
+        </div>`;}).join('')
+      :'<span style="color:var(--ft)">Noch keine Daten</span>';
+    // Offene Signale
+    const openSigs=(wa.open_signals||[]).filter(s=>s.status==='PENDING');
+    document.getElementById('wa-open').innerHTML=openSigs.length
+      ?openSigs.map(s=>`<span class="${s.direction==='BUY'?'pos':'neg'}" style="font-weight:700">${s.direction}</span>`+
+        ` [${s.timeframe||'—'}] Score:${s.score||'—'} @ ${s.entry||'—'}`+
+        ` · TP1:${s.tp1||'—'} TP2:${s.tp2||'—'} TP3:${s.tp3||'—'} SL:${s.sl||'—'}`+
+        ` · <span style="color:var(--ft)">${(s.open_time||'').slice(11,16)} UTC</span>`
+        ).join('<br>')
+      :'Keine offenen Signale';
+    // Verlauf
+    const closedSigs=(wa.closed_signals||[]).slice(0,20);
+    document.getElementById('wa-history').innerHTML=closedSigs.length
+      ?closedSigs.map(s=>{
+        const res=s.result||s.status||'—';
+        const pip=s.pips!==null&&s.pips!==undefined?(s.pips>=0?'+':'')+s.pips:'—';
+        return `<tr>
+          <td>${(s.open_time||'').slice(11,16)}</td>
+          <td class="${s.direction==='BUY'?'pos':'neg'}" style="font-weight:700">${s.direction}</td>
+          <td>${s.timeframe||'—'}</td>
+          <td class="pur">${s.score||'—'}</td>
+          <td>${s.entry||'—'}</td>
+          <td class="pos">${s.tp1||'—'}</td>
+          <td class="pos">${s.tp2||'—'}</td>
+          <td class="neg">${s.sl||'—'}</td>
+          <td>${s.close_price||'—'}</td>
+          <td class="${s.pips>=0?'pos':'neg'}">${pip}</td>
+          <td class="amr">${s.tp_level_hit?'TP'+s.tp_level_hit:'—'}</td>
+          <td class="${res==='WIN'?'pos':res==='LOSS'?'neg':'neu'}" style="font-weight:700">${res}</td>
+        </tr>`;}).join('')
+      :'<tr><td colspan="12" style="text-align:center;padding:10px;color:var(--ft)">Noch keine abgeschlossenen Signale</td></tr>';
+
     // ── TAB 2: MEAN REVERSION ──
     const mr=sstats.MEAN_REVERSION||{};
     const mrPnl=mr.pnl||0;
@@ -1788,6 +2239,7 @@ def state():
         "performance":bot_state["performance"],
         "news_lock":bot_state["news_lock"],"news_lock_reason":bot_state["news_lock_reason"],
         "demo_account":get_demo_snapshot(),
+        "willy_analytics":bot_state["willy_analytics"],
     })
 
 @app.route("/trades")
@@ -1823,15 +2275,20 @@ def settings():
 @app.route("/webhook",methods=["POST"])
 def webhook():
     try:
-        data=request.get_json(force=True); add_log(f"Webhook: {data}","INFO")
+        data=request.get_json(force=True)
+        add_log(f"Webhook empfangen: {data}","INFO")
         st=data.get("signal","").upper(); tf=data.get("timeframe","—")
         pr=data.get("price") or data.get("close")
+        # Preis in Preisliste aufnehmen
         if pr:
             try:
                 pf=float(str(pr).replace(",","."))
                 if 1500<pf<6000: bot_state["prices"].append(pf); bot_state["price"]=pf
             except: pass
         if st:
+            # WillyAlgoTrader Signal vollständig verarbeiten
+            process_willy_signal(data)
+            # willy_last und willy_signals für Rückwärtskompatibilität
             we={"signal_type":st,"timeframe":tf,"score":data.get("score","—"),
                 "entry":data.get("entry") or pr,"tp1":data.get("tp1"),
                 "tp2":data.get("tp2"),"tp3":data.get("tp3"),"sl":data.get("sl"),
@@ -1840,8 +2297,7 @@ def webhook():
             bot_state["willy_last"]=we
             bot_state["willy_signals"].insert(0,we)
             if len(bot_state["willy_signals"])>200: bot_state["willy_signals"].pop()
-            add_log(f"⭐ WillyAlgoTrader: {st} | TF:{tf}","SIGNAL")
-        return jsonify({"status":"ok"}),200
+        return jsonify({"status":"ok","signal":st,"tracked":True}),200
     except Exception as e:
         add_log(f"Webhook Fehler: {e}","ERROR"); return jsonify({"status":"error"}),400
 
