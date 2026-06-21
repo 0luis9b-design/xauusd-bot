@@ -1919,18 +1919,19 @@ async function refresh(){
     document.getElementById('bar-ms').style.width=Math.min((ss.macro_structure||0)/mx*100,100)+'%';
 
     // ── TAB: WILLYALGOTRADER ──
-    const wa=d.willy_analytics||{};
-    const waTotal=wa.total||0,waWins=wa.wins||0,waLosses=wa.losses||0;
+    // Umbenennung zu willy_a (wa war schon für weekly_analysis vergeben → JS-Fehler behoben)
+    const willy_a=d.willy_analytics||{};
+    const waTotal=willy_a.total||0,waWins=willy_a.wins||0,waLosses=willy_a.losses||0;
     document.getElementById('wa-total').textContent=waTotal;
     const waWrEl=document.getElementById('wa-wr');
-    waWrEl.textContent=wa.overall_win_rate?wa.overall_win_rate+'%':'—';
-    waWrEl.className='dv '+(wa.overall_win_rate>=55?'pos':wa.overall_win_rate>=45?'amr':'neg');
+    waWrEl.textContent=willy_a.overall_win_rate?willy_a.overall_win_rate+'%':'—';
+    waWrEl.className='dv '+(willy_a.overall_win_rate>=55?'pos':willy_a.overall_win_rate>=45?'amr':'neg');
     document.getElementById('wa-wl').textContent=waWins+' / '+waLosses;
     document.getElementById('wa-wl').className='dv '+(waWins>waLosses?'pos':waWins<waLosses?'neg':'neu');
-    document.getElementById('wa-pending').textContent=wa.pending||0;
-    document.getElementById('wa-best').textContent=wa.best_signal_type||'—';
+    document.getElementById('wa-pending').textContent=willy_a.pending||0;
+    document.getElementById('wa-best').textContent=willy_a.best_signal_type||'—';
     // TP/SL Distribution
-    const tp1h=wa.tp1_hits||0,tp2h=wa.tp2_hits||0,tp3h=wa.tp3_hits||0,slh=wa.sl_hits||0;
+    const tp1h=willy_a.tp1_hits||0,tp2h=willy_a.tp2_hits||0,tp3h=willy_a.tp3_hits||0,slh=willy_a.sl_hits||0;
     const tpMax=Math.max(tp1h,tp2h,tp3h,slh,1);
     document.getElementById('wa-tp1').textContent=tp1h;
     document.getElementById('wa-tp2').textContent=tp2h;
@@ -1941,8 +1942,8 @@ async function refresh(){
     document.getElementById('wa-tp3-bar').style.width=Math.min(tp3h/tpMax*100,100)+'%';
     document.getElementById('wa-sl-bar').style.width=Math.min(slh/tpMax*100,100)+'%';
     // BUY/SELL
-    const buyD=(wa.by_direction||{}).BUY||{};
-    const sellD=(wa.by_direction||{}).SELL||{};
+    const buyD=(willy_a.by_direction||{}).BUY||{};
+    const sellD=(willy_a.by_direction||{}).SELL||{};
     document.getElementById('wa-buy-wr').textContent=buyD.win_rate?buyD.win_rate+'%':'—';
     document.getElementById('wa-buy-count').textContent=buyD.count||0;
     document.getElementById('wa-buy-wins').textContent=buyD.wins||0;
@@ -1960,36 +1961,36 @@ async function refresh(){
     document.getElementById('wa-sell-tp2').textContent=sellD.tp2||0;
     document.getElementById('wa-sell-tp3').textContent=sellD.tp3||0;
     // By TF
-    const byTf=wa.by_tf||{};
+    const byTf=willy_a.by_tf||{};
     document.getElementById('wa-by-tf').innerHTML=Object.keys(byTf).length
       ?Object.entries(byTf).sort((a,b)=>b[1].count-a[1].count).map(([tf2,v])=>{
-        const r=v.wins+v.losses; const wr=r>0?v.win_rate:null;
+        const rtf=v.wins+v.losses; const wrtf=rtf>0?v.win_rate:null;
         return `<div class="row" style="padding:5px 0">
           <span class="rk" style="font-size:13px;font-weight:700">${tf2}</span>
           <span>
-            <span class="${wr>=55?'pos':wr>=45?'amr':'neg'}" style="font-size:15px;font-weight:700">${wr!==null?wr+'%':'—'}</span>
-            <span class="meta" style="display:inline;margin-left:8px">${v.wins}W / ${v.losses}L / ${v.pending}⏳ (${v.count} total)</span>
+            <span class="${wrtf>=55?'pos':wrtf>=45?'amr':'neg'}" style="font-size:15px;font-weight:700">${wrtf!==null?wrtf+'%':'—'}</span>
+            <span class="meta" style="display:inline;margin-left:8px">${v.wins}W / ${v.losses}L / ${v.pending||0}⏳ (${v.count} total)</span>
             ${v.tp1?`<span class="cfp" style="margin-left:4px">TP1:${v.tp1}</span>`:''}
             ${v.tp2?`<span class="cfp">TP2:${v.tp2}</span>`:''}
             ${v.tp3?`<span class="cfp">TP3:${v.tp3}</span>`:''}
           </span>
         </div>`;}).join('')
-      :'<span style="color:var(--ft)">Noch keine Daten</span>';
+      :'<span style="color:var(--ft)">Noch keine Daten — warte auf Signale</span>';
     // By Score
-    const byScore=wa.by_score||{};
+    const byScore=willy_a.by_score||{};
     document.getElementById('wa-by-score').innerHTML=Object.keys(byScore).length
       ?Object.entries(byScore).sort((a,b)=>b[1].count-a[1].count).map(([sc,v])=>{
-        const r=v.wins+v.losses; const wr=r>0?v.win_rate:null;
+        const rsc=v.wins+v.losses; const wrsc=rsc>0?v.win_rate:null;
         return `<div class="row" style="padding:5px 0">
           <span class="rk" style="font-size:13px;font-weight:700">Score: ${sc}</span>
           <span>
-            <span class="${wr>=55?'pos':wr>=45?'amr':'neg'}" style="font-size:15px;font-weight:700">${wr!==null?wr+'%':'—'}</span>
-            <span class="meta" style="display:inline;margin-left:8px">${v.wins}W / ${v.losses}L / ${v.pending}⏳</span>
+            <span class="${wrsc>=55?'pos':wrsc>=45?'amr':'neg'}" style="font-size:15px;font-weight:700">${wrsc!==null?wrsc+'%':'—'}</span>
+            <span class="meta" style="display:inline;margin-left:8px">${v.wins}W / ${v.losses}L / ${v.pending||0}⏳</span>
           </span>
         </div>`;}).join('')
       :'<span style="color:var(--ft)">Noch keine Daten</span>';
     // Offene Signale
-    const openSigs=(wa.open_signals||[]).filter(s=>s.status==='PENDING');
+    const openSigs=(willy_a.open_signals||[]).filter(s=>s.status==='PENDING');
     document.getElementById('wa-open').innerHTML=openSigs.length
       ?openSigs.map(s=>`<span class="${s.direction==='BUY'?'pos':'neg'}" style="font-weight:700">${s.direction}</span>`+
         ` [${s.timeframe||'—'}] Score:${s.score||'—'} @ ${s.entry||'—'}`+
@@ -1998,7 +1999,7 @@ async function refresh(){
         ).join('<br>')
       :'Keine offenen Signale';
     // Verlauf
-    const closedSigs=(wa.closed_signals||[]).slice(0,20);
+    const closedSigs=(willy_a.closed_signals||[]).slice(0,20);
     document.getElementById('wa-history').innerHTML=closedSigs.length
       ?closedSigs.map(s=>{
         const res=s.result||s.status||'—';
@@ -2013,7 +2014,7 @@ async function refresh(){
           <td class="pos">${s.tp2||'—'}</td>
           <td class="neg">${s.sl||'—'}</td>
           <td>${s.close_price||'—'}</td>
-          <td class="${s.pips>=0?'pos':'neg'}">${pip}</td>
+          <td class="${(s.pips||0)>=0?'pos':'neg'}">${pip}</td>
           <td class="amr">${s.tp_level_hit?'TP'+s.tp_level_hit:'—'}</td>
           <td class="${res==='WIN'?'pos':res==='LOSS'?'neg':'neu'}" style="font-weight:700">${res}</td>
         </tr>`;}).join('')
