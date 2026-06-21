@@ -83,6 +83,20 @@ bot_state = {
     "performance":{
         "expectancy":0.0,"profit_factor":0.0,"avg_crv":0.0,"sharpe":0.0,
     },
+    # ─── Smart Money Concepts (SMC) / Institutionelle Analyse ───
+    "smc":{
+        "order_blocks":[],          # Bullish & Bearish Order Blocks
+        "liquidity_zones":[],       # BSL/SSL, Equal Highs/Lows, Round Numbers
+        "fair_value_gaps":[],       # Bullish & Bearish FVGs
+        "bos_choch":{},             # Break of Structure / Change of Character
+        "premium_discount":{},      # Premium/Discount/Equilibrium Zone
+        "institutional_moves":[],   # Stop Hunts, Impulse-Kerzen
+        "smc_bias":"NEUTRAL",       # Gesamtbias aus SMC-Sicht
+        "smc_score":0,              # Score für Signal-Engine
+        "nearest_ob":None,          # Nächster aktiver Order Block
+        "nearest_lz":None,          # Nächste Liquiditätszone
+        "last_updated":"—",
+    },
     "demo_account":{
         "starting_balance":1000.0,"balance":1000.0,"max_leverage":5,
         "risk_per_trade_pct":5.0,"margin_used":0.0,"leverage_used":0.0,
@@ -1035,6 +1049,292 @@ def check_willy_open_signals(price):
     if to_close:
         _recalc_willy_stats()
         add_log(f"Willy: {len(to_close)} Signal(e) automatisch aufgelöst","INFO")
+
+# ═══════════════════════════════════════════════════════
+# SMART MONEY CONCEPTS (SMC) — Institutionelle Analyse
+# ═══════════════════════════════════════════════════════
+
+def find_order_blocks(candles, lookback=60):
+    """
+    Order Blocks: Letzte Gegenkerze vor einem starken Impuls.
+    Institutionen platzieren dort ihre Orders → starke S/R-Zonen.
+    Bullish OB: Letzte bearishe Kerze vor bullischem Impuls
+    Bearish OB: Letzte bullishe Kerze vor bearischem Impuls
+    """
+    if len(candles) < 8: return []
+    obs = []; sub = candles[-lookback:] if len(candles) > lookback else candles
+    atr_proxy = sum(abs(sub[i]["close"]-sub[i-1]["close"]) for i in range(1,len(sub)))/len(sub) if len(sub)>1 else 10
+    for i in range(1, len(sub)-3):
+        c=sub[i]; n1=sub[i+1]; n2=sub[i+2]; n3=sub[i+3]
+        body_c=abs(c["close"]-c["open"])
+        # BULLISH OB: bearishe Kerze gefolgt von starkem bullischem Impuls
+        if c["close"]<c["open"]:
+            impulse=(n3["close"]-c["low"])
+            if impulse > atr_proxy*2 and n1["close"]>n1["open"] and n2["close"]>n2["open"]:
+                strength=round(min(impulse/atr_proxy/3,1.0)*100,0)
+                obs.append({"type":"BULLISH_OB","high":c["high"],"low":c["low"],
+                    "mid":round((c["high"]+c["low"])/2,2),"strength":strength,
+                    "label":f"Bullish OB {c['low']:.2f}–{c['high']:.2f}","active":True,
+                    "idx":i,"impulse":round(impulse,2)})
+        # BEARISH OB: bullishe Kerze gefolgt von starkem bearischem Impuls
+        if c["close"]>c["open"]:
+            impulse=(c["high"]-n3["close"])
+            if impulse > atr_proxy*2 and n1["close"]<n1["open"] and n2["close"]<n2["open"]:
+                strength=round(min(impulse/atr_proxy/3,1.0)*100,0)
+                obs.append({"type":"BEARISH_OB","high":c["high"],"low":c["low"],
+                    "mid":round((c["high"]+c["low"])/2,2),"strength":strength,
+                    "label":f"Bearish OB {c['low']:.2f}–{c['high']:.2f}","active":True,
+                    "idx":i,"impulse":round(impulse,2)})
+    # Nur die 8 stärksten behalten
+    obs_sorted=sorted(obs,key=lambda x:x["strength"],reverse=True)
+    return obs_sorted[:8]
+
+def find_liquidity_zones(candles, price, lookback=60):
+    """
+    Liquiditätszonen: Wo liegen Stop-Orders konzentriert?
+    - Buy-Side Liquidity (BSL): Stops über Swing-Highs / Equal Highs
+    - Sell-Side Liquidity (SSL): Stops unter Swing-Lows / Equal Lows
+    - Round Numbers: Psychologische Level (jeder 50er/100er)
+    """
+    if len(candles)<8 or not price: return []
+    zones=[]; sub=candles[-lookback:] if len(candles)>lookback else candles
+    tol=price*0.0008  # 0.08% Toleranz für Equal H/L
+    # Swing Highs → BSL (Buy-Side Liquidity: Stops über den Hochs)
+    sh_seen=set()
+    for i in range(2,len(sub)-2):
+        h=sub[i]["high"]
+        if h>sub[i-1]["high"] and h>sub[i-2]["high"] and h>sub[i+1]["high"] and h>sub[i+2]["high"]:
+            lv=round(h,1)
+            if lv not in sh_seen:
+                sh_seen.add(lv)
+                zones.append({"type":"BSL","level":h,"direction":"ABOVE",
+                    "label":f"Buy-Side Liq. (BSL) @ {h:.2f}",
+                    "dist_pct":round((h-price)/price*100,2),"strength":60})
+    # Swing Lows → SSL (Sell-Side Liquidity: Stops unter den Tiefs)
+    sl_seen=set()
+    for i in range(2,len(sub)-2):
+        l=sub[i]["low"]
+        if l<sub[i-1]["low"] and l<sub[i-2]["low"] and l<sub[i+1]["low"] and l<sub[i+2]["low"]:
+            lv=round(l,1)
+            if lv not in sl_seen:
+                sl_seen.add(lv)
+                zones.append({"type":"SSL","level":l,"direction":"BELOW",
+                    "label":f"Sell-Side Liq. (SSL) @ {l:.2f}",
+                    "dist_pct":round((price-l)/price*100,2),"strength":60})
+    # Equal Highs / Equal Lows (doppelte Bestätigung = mehr Stops)
+    highs=[c["high"] for c in sub]; lows=[c["low"] for c in sub]
+    for i in range(len(sub)):
+        for j in range(i+3,len(sub)):
+            if abs(sub[i]["high"]-sub[j]["high"])<tol:
+                lv=round((sub[i]["high"]+sub[j]["high"])/2,2)
+                zones.append({"type":"EQH","level":lv,"direction":"ABOVE",
+                    "label":f"Equal Highs (EQH) @ {lv:.2f} ← Hohe Liquidität!",
+                    "dist_pct":round((lv-price)/price*100,2),"strength":85})
+                break
+            if abs(sub[i]["low"]-sub[j]["low"])<tol:
+                lv=round((sub[i]["low"]+sub[j]["low"])/2,2)
+                zones.append({"type":"EQL","level":lv,"direction":"BELOW",
+                    "label":f"Equal Lows (EQL) @ {lv:.2f} ← Hohe Liquidität!",
+                    "dist_pct":round((price-lv)/price*100,2),"strength":85})
+                break
+    # Round Numbers (psychologische Levels für Gold)
+    for step in [50,100,250,500]:
+        base=round(price/step)*step
+        for offset in [-step*2,-step,0,step,step*2]:
+            lv=base+offset
+            if lv>0 and abs(lv-price)/price<0.025:
+                zones.append({"type":"ROUND","level":float(lv),"direction":"ABOVE" if lv>price else "BELOW",
+                    "label":f"Psych. Level @ {lv:.0f}",
+                    "dist_pct":round(abs(lv-price)/price*100,2),"strength":50})
+    # Sortieren nach Distanz, Duplikate entfernen
+    seen=set(); unique=[]
+    for z in sorted(zones,key=lambda x:abs(x.get("dist_pct",99))):
+        k=round(z["level"]/5)*5
+        if k not in seen: seen.add(k); unique.append(z)
+    return unique[:12]
+
+def find_fair_value_gaps(candles, lookback=40):
+    """
+    Fair Value Gaps (FVG) / Imbalances:
+    3-Kerzen-Muster wo Angebot/Nachfrage unausgeglichen sind.
+    Preis kehrt oft zurück um diese Lücken zu 'füllen'.
+    Bullish FVG: c[i-1].high < c[i+1].low  (Gap nach oben)
+    Bearish FVG: c[i-1].low  > c[i+1].high (Gap nach unten)
+    """
+    if len(candles)<5: return []
+    fvgs=[]; sub=candles[-lookback:] if len(candles)>lookback else candles
+    price=sub[-1]["close"]
+    min_gap=max(price*0.0003,0.3)  # Mindestgröße relativ zum Preis
+    for i in range(1,len(sub)-1):
+        p=sub[i-1]; n=sub[i+1]
+        # Bullish FVG
+        if n["low"]>p["high"] and (n["low"]-p["high"])>min_gap:
+            gap=round(n["low"]-p["high"],2)
+            is_filled=p["high"]<=price<=n["low"]
+            fvgs.append({"type":"BFVG","top":n["low"],"bottom":p["high"],
+                "mid":round((n["low"]+p["high"])/2,2),"size":gap,
+                "filled":price<p["high"],"in_zone":is_filled,
+                "label":f"Bullish FVG {p['high']:.2f}–{n['low']:.2f} ({gap:.2f} Pkt)",
+                "direction":"SUPPORT"})
+        # Bearish FVG
+        if p["low"]>n["high"] and (p["low"]-n["high"])>min_gap:
+            gap=round(p["low"]-n["high"],2)
+            is_filled=n["high"]<=price<=p["low"]
+            fvgs.append({"type":"BAFVG","top":p["low"],"bottom":n["high"],
+                "mid":round((p["low"]+n["high"])/2,2),"size":gap,
+                "filled":price>p["low"],"in_zone":is_filled,
+                "label":f"Bearish FVG {n['high']:.2f}–{p['low']:.2f} ({gap:.2f} Pkt)",
+                "direction":"RESISTANCE"})
+    # Unfüllte FVGs priorisieren, max 8
+    unfilled=[f for f in fvgs if not f["filled"]]
+    return sorted(unfilled,key=lambda x:x["size"],reverse=True)[:8]
+
+def detect_bos_choch(candles):
+    """
+    Break of Structure (BOS): Strukturbruch in Trendrichtung → Fortsetzung
+    Change of Character (CHoCH): Strukturbruch gegen Trend → potenzielle Umkehr!
+    """
+    if len(candles)<15: return {"bos":None,"choch":None,"structure":"UNDEFINED","last_high":None,"last_low":None}
+    sub=candles[-25:] if len(candles)>25 else candles
+    price=sub[-1]["close"]
+    # Swing Highs/Lows finden
+    sh=[]; sl_=[]
+    for i in range(2,len(sub)-2):
+        if sub[i]["high"]>sub[i-1]["high"] and sub[i]["high"]>sub[i-2]["high"] and \
+           sub[i]["high"]>sub[i+1]["high"] and sub[i]["high"]>sub[i+2]["high"]:
+            sh.append(round(sub[i]["high"],2))
+        if sub[i]["low"]<sub[i-1]["low"] and sub[i]["low"]<sub[i-2]["low"] and \
+           sub[i]["low"]<sub[i+1]["low"] and sub[i]["low"]<sub[i+2]["low"]:
+            sl_.append(round(sub[i]["low"],2))
+    if len(sh)<2 or len(sl_)<2:
+        return {"bos":None,"choch":None,"structure":"UNDEFINED",
+                "last_high":round(max(c["high"] for c in sub[-5:]),2),
+                "last_low":round(min(c["low"] for c in sub[-5:]),2)}
+    lh=sh[-1]; ph=sh[-2]; ll=sl_[-1]; pl=sl_[-2]
+    hh=lh>ph; hl=ll>pl; lhigh=lh<ph; ll_=ll<pl
+    bos=None; choch=None
+    if hh and hl: structure="UPTREND ▲"
+    elif lhigh and ll_: structure="DOWNTREND ▼"
+    else: structure="RANGING ↔"
+    # BOS/CHoCH erkennen
+    if "UPTREND" in structure:
+        if price>lh: bos={"label":f"BOS ↑ über {lh:.2f}","level":lh,"dir":"BUY","type":"BOS"}
+        if price<ll: choch={"label":f"⚠ CHoCH! Unter {ll:.2f} → Umkehr bearish?","level":ll,"dir":"SELL","type":"CHoCH"}
+    elif "DOWNTREND" in structure:
+        if price<ll: bos={"label":f"BOS ↓ unter {ll:.2f}","level":ll,"dir":"SELL","type":"BOS"}
+        if price>lh: choch={"label":f"⚠ CHoCH! Über {lh:.2f} → Umkehr bullish?","level":lh,"dir":"BUY","type":"CHoCH"}
+    return {"bos":bos,"choch":choch,"structure":structure,
+            "last_high":lh,"last_low":ll,"prev_high":ph,"prev_low":pl}
+
+def calc_premium_discount(candles, price):
+    """
+    Premium/Discount Zone (SMC-Konzept):
+    > 75% der Range = Premium (teuer → gut zum Verkaufen)
+    50% = Equilibrium
+    < 25% der Range = Discount (günstig → gut zum Kaufen)
+    """
+    if len(candles)<5 or not price:
+        return {"zone":"UNBEKANNT","pct":50.0,"equilibrium":price}
+    sub=candles[-30:] if len(candles)>30 else candles
+    hi=max(c["high"] for c in sub); lo=min(c["low"] for c in sub)
+    if hi==lo: return {"zone":"EQUILIBRIUM","pct":50.0,"high":hi,"low":lo,"equilibrium":round(hi,2)}
+    pct=round((price-lo)/(hi-lo)*100,1)
+    if pct>=75:   zone="PREMIUM 🔴 (Verkaufen)"
+    elif pct>=60: zone="LEICHT PREMIUM"
+    elif pct>=40: zone="EQUILIBRIUM ⚖"
+    elif pct>=25: zone="LEICHT DISCOUNT"
+    else:         zone="DISCOUNT 🟢 (Kaufen)"
+    return {"zone":zone,"pct":pct,"high":round(hi,2),"low":round(lo,2),
+            "equilibrium":round((hi+lo)/2,2),"range":round(hi-lo,2)}
+
+def detect_institutional_moves(candles, inds):
+    """
+    Institutionelle Muster:
+    - Stop Hunt / Liquidity Sweep: Spike über/unter Level, schnelle Umkehr
+    - Impulse-Kerze: Starke Kerze mit wenig Docht = Institutioneller Kauf/Verkauf
+    - Accumulation: Seitwärts mit verdichtetem Volumen (Range vor Ausbruch)
+    - Rejection: Langer Docht = Preis wurde aktiv abgelehnt
+    """
+    if len(candles)<5: return []
+    moves=[]; sub=candles[-15:] if len(candles)>15 else candles
+    atr_v=inds.get("atr",20) or 20; price=inds.get("price") or sub[-1]["close"]
+    for i in range(1,len(sub)):
+        c=sub[i]; prev=sub[i-1]
+        rng=c["high"]-c["low"]
+        if rng==0: continue
+        body=abs(c["close"]-c["open"])
+        up_wick=c["high"]-max(c["close"],c["open"])
+        dn_wick=min(c["close"],c["open"])-c["low"]
+        body_ratio=body/rng
+        # Stop Hunt nach oben (langer oberer Docht → bearish Umkehr)
+        if up_wick>body*2.5 and rng>atr_v*0.6:
+            moves.append({"type":"STOP_HUNT","dir":"BEARISH",
+                "label":f"🔴 Stop Hunt ↑ @ {c['high']:.2f} (langer Docht oben → Umkehr möglich)",
+                "level":c["high"],"strength":"HOCH"})
+        # Stop Hunt nach unten (langer unterer Docht → bullish Umkehr)
+        if dn_wick>body*2.5 and rng>atr_v*0.6:
+            moves.append({"type":"STOP_HUNT","dir":"BULLISH",
+                "label":f"🟢 Stop Hunt ↓ @ {c['low']:.2f} (langer Docht unten → Umkehr möglich)",
+                "level":c["low"],"strength":"HOCH"})
+        # Institutionelle Impulse-Kerze (großer Body, wenig Docht)
+        if body>atr_v*1.5 and body_ratio>0.75:
+            d="BULLISH ▲" if c["close"]>c["open"] else "BEARISH ▼"
+            moves.append({"type":"IMPULSE","dir":d,
+                "label":f"⚡ Institutioneller Impuls {d} ({body:.1f} Pkt, Body {body_ratio*100:.0f}%)",
+                "level":c["close"],"strength":"MITTEL"})
+        # Rejection Block (Preis wurde scharf abgelehnt)
+        if (up_wick>atr_v*0.8 or dn_wick>atr_v*0.8) and body<rng*0.3:
+            dir_="BEARISH" if up_wick>dn_wick else "BULLISH"
+            lv=c["high"] if dir_=="BEARISH" else c["low"]
+            moves.append({"type":"REJECTION","dir":dir_,
+                "label":f"↩ Rejection {dir_} @ {lv:.2f} (Preis abgelehnt)",
+                "level":lv,"strength":"MITTEL"})
+    return moves[-6:] if len(moves)>6 else moves
+
+def update_smc_analysis():
+    """Führt alle SMC-Analysen durch und speichert Ergebnisse in bot_state."""
+    price=bot_state.get("price")
+    candles=bot_state["candles"].get("1h",[])
+    candles_4h=bot_state["candles"].get("4h",[])
+    inds=bot_state.get("indicators",{})
+    if not price or len(candles)<10: return
+    smc=bot_state["smc"]
+    # Alle Analysen ausführen
+    smc["order_blocks"]=find_order_blocks(candles,60)
+    smc["liquidity_zones"]=find_liquidity_zones(candles,price,60)
+    smc["fair_value_gaps"]=find_fair_value_gaps(candles,40)
+    smc["bos_choch"]=detect_bos_choch(candles)
+    smc["premium_discount"]=calc_premium_discount(candles,price)
+    smc["institutional_moves"]=detect_institutional_moves(candles,inds)
+    # Nächsten Order Block finden
+    active_obs=[ob for ob in smc["order_blocks"] if ob["active"]]
+    if active_obs:
+        nearest=min(active_obs,key=lambda x:abs(x["mid"]-price))
+        smc["nearest_ob"]=nearest
+    else: smc["nearest_ob"]=None
+    # Nächste Liquiditätszone
+    if smc["liquidity_zones"]:
+        smc["nearest_lz"]=smc["liquidity_zones"][0]
+    # SMC-Bias bestimmen
+    pd=smc["premium_discount"]; boc=smc["bos_choch"]; nob=smc["nearest_ob"]
+    score=0
+    if "DISCOUNT" in pd.get("zone",""): score+=2
+    if "PREMIUM" in pd.get("zone",""): score-=2
+    if boc.get("bos") and boc["bos"].get("dir")=="BUY": score+=2
+    if boc.get("bos") and boc["bos"].get("dir")=="SELL": score-=2
+    if boc.get("choch") and boc["choch"].get("dir")=="BUY": score+=1
+    if boc.get("choch") and boc["choch"].get("dir")=="SELL": score-=1
+    if nob and nob["type"]=="BULLISH_OB" and abs(price-nob["mid"])<10: score+=2
+    if nob and nob["type"]=="BEARISH_OB" and abs(price-nob["mid"])<10: score-=2
+    # Bullishe FVGs unter Preis (Preismagnet nach unten = kann zurückfallen)
+    bfvg_below=[f for f in smc["fair_value_gaps"] if f["type"]=="BFVG" and f["mid"]<price]
+    if bfvg_below: score+=1
+    smc["smc_score"]=score
+    if score>=3:    smc["smc_bias"]="BULLISH 🟢"
+    elif score<=-3: smc["smc_bias"]="BEARISH 🔴"
+    else:           smc["smc_bias"]="NEUTRAL ⚪"
+    smc["last_updated"]=datetime.datetime.utcnow().strftime("%H:%M:%S UTC")
+    add_log(f"SMC: {smc['smc_bias']} | PD:{pd.get('zone','?')} | OBs:{len(active_obs)} | LZs:{len(smc['liquidity_zones'])} | FVGs:{len(smc['fair_value_gaps'])}","INFO")
 
 def analysis_loop():
     add_log("XAUUSD KI-Bot v4.0 — 4 Strategien, Macro-Analyse, Guardrails, Tab-Dashboard","INFO")
