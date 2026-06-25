@@ -105,6 +105,26 @@ bot_state = {
         "total_pnl_eur":0.0,
         "currency_note":"1 USD ≈ 1 EUR (vereinfacht) · 1 Lot = 100 oz · 1 Punkt = Lot×100 EUR",
     },
+    # ─── NEU: Sentiment & Makro-Analyse (Bilder 1, 2, 4) ───
+    # Manche Faktoren sind automatisch berechenbar (DXY, Yields, Fed-Proxy, COT-Versuch via CFTC.gov),
+    # andere benötigen kostenpflichtige/registrierungspflichtige Feeds (Reuters/Bloomberg, FOMC-Text,
+    # LBMA/WGC, echte CPI/PCE-Releases, Zentralbank-Käufe) und sind daher manuell über /sentiment
+    # aktualisierbar. Das ist bewusst transparent gehalten statt Daten zu simulieren.
+    "sentiment":{
+        "real_yields_proxy":None,"real_yields_prev":None,"real_yields_status":"—",
+        "fed_rate_expectation":{"status":"—","note":"Proxy aus Yields-Trend (keine echten Fed-Funds-Futures-Daten)"},
+        "geopolitical_risk":{"level":"NEUTRAL","note":"Noch nicht gesetzt — manuell über /sentiment aktualisieren","manual":True,"updated":"—"},
+        "cpi_pce_inflation":{"value":None,"trend":"—","note":"Noch nicht gesetzt — manuell über /sentiment aktualisieren","manual":True,"updated":"—"},
+        "central_bank_buying":{"status":"—","note":"Noch nicht gesetzt — manuell über /sentiment aktualisieren","manual":True,"updated":"—"},
+        "cot_report":{"net_long_pct":None,"status":"—","note":"Best-effort Versuch via CFTC.gov, sonst manuell","manual":True,"updated":"—"},
+        "retail_sentiment":{"bullish_pct":None,"note":"Noch nicht gesetzt — manuell über /sentiment aktualisieren","manual":True,"updated":"—"},
+        "overall_sentiment_pct":50.0,"overall_sentiment_label":"NEUTRAL ⚪","overall_sentiment_notes":[],
+        "data_sources":{
+            "Reuters / Bloomberg":"MANUELL","Fed FOMC Statements":"MANUELL","LBMA / WGC Data":"MANUELL",
+            "TradingView Webhook":"AKTIV","CFTC COT Reports":"AUTO (best-effort)","Macroaxis / Investing.com":"MANUELL",
+        },
+        "last_updated":"—",
+    },
 }
 
 def add_log(msg,level="INFO"):
@@ -255,11 +275,61 @@ def calc_fib(candles,p=50):
     return {"0":round(hi,2),"23.6":round(hi-0.236*diff,2),"38.2":round(hi-0.382*diff,2),
             "50":round(hi-0.5*diff,2),"61.8":round(hi-0.618*diff,2),"100":round(lo,2)}
 
+# ─── NEU: Ichimoku-Wolke (Bild 4: "TREND" Tab) ───
+def calc_ichimoku(candles):
+    """
+    Ichimoku Kinko Hyo (klassische Settings 9/26/52):
+    Tenkan-sen (9), Kijun-sen (26), Senkou Span A/B (Wolke), Chikou-Status.
+    Gibt zusätzlich eine textuelle Cloud-Position zurück ("ÜBER WOLKE" etc.)
+    """
+    n=len(candles)
+    if n<52: return {"tenkan":None,"kijun":None,"senkou_a":None,"senkou_b":None,
+                      "cloud_top":None,"cloud_bottom":None,"cloud_status":"—","label":"—"}
+    def hl_mid(span):
+        seg=candles[-span:]
+        return round((max(c["high"] for c in seg)+min(c["low"] for c in seg))/2,2)
+    tenkan=hl_mid(9); kijun=hl_mid(26)
+    senkou_a=round((tenkan+kijun)/2,2)
+    senkou_b=hl_mid(52)
+    cloud_top=max(senkou_a,senkou_b); cloud_bottom=min(senkou_a,senkou_b)
+    price=candles[-1]["close"]
+    if price>cloud_top:    status="ÜBER WOLKE"; label="BULLISH"
+    elif price<cloud_bottom: status="UNTER WOLKE"; label="BEARISH"
+    else: status="IN DER WOLKE"; label="NEUTRAL"
+    tk_cross="BULLISH" if tenkan>kijun else "BEARISH" if tenkan<kijun else "NEUTRAL"
+    return {"tenkan":tenkan,"kijun":kijun,"senkou_a":senkou_a,"senkou_b":senkou_b,
+            "cloud_top":cloud_top,"cloud_bottom":cloud_bottom,
+            "cloud_status":status,"label":label,"tk_cross":tk_cross}
+
+# ─── NEU: Support/Resistance Key-Level (Bild 4: "Sup/Res · KEY LEVEL") ───
+def calc_support_resistance(candles,lookback=40):
+    """
+    Einfache Swing-basierte Support/Resistance-Erkennung für den aktuellen Zeitrahmen.
+    Liefert das naheliegendste Key-Level (Support oder Resistance) zum aktuellen Preis.
+    """
+    if len(candles)<10: return {"support":None,"resistance":None,"key_level":None,"key_level_type":"—"}
+    sub=candles[-lookback:] if len(candles)>lookback else candles
+    price=sub[-1]["close"]
+    highs=[c["high"] for c in sub]; lows=[c["low"] for c in sub]
+    resistance=round(max(highs),2); support=round(min(lows),2)
+    dist_res=abs(resistance-price); dist_sup=abs(price-support)
+    if dist_res<=dist_sup:
+        key_level=resistance; key_type="RESISTANCE"
+    else:
+        key_level=support; key_type="SUPPORT"
+    return {"support":support,"resistance":resistance,
+            "key_level":key_level,"key_level_type":key_type}
+
 def build_indicators(prices,candles=None):
     if len(prices)<30: return {}
     m,ms,mh=calc_macd(prices); bl,bm,bu=calc_bollinger(prices); sk,sd=calc_stoch(prices)
     poc=vah=val=None
-    if candles: poc,vah,val=calc_volume_profile(candles)
+    ichimoku={"tenkan":None,"kijun":None,"senkou_a":None,"senkou_b":None,"cloud_status":"—","label":"—"}
+    supres={"support":None,"resistance":None,"key_level":None,"key_level_type":"—"}
+    if candles:
+        poc,vah,val=calc_volume_profile(candles)
+        ichimoku=calc_ichimoku(candles)
+        supres=calc_support_resistance(candles)
     return {"price":prices[-1],"ema9":calc_ema(prices,9),"ema20":calc_ema(prices,20),
             "ema50":calc_ema(prices,50),"ema100":calc_ema(prices,100),"ema200":calc_ema(prices,200),
             "rsi":calc_rsi(prices),"macd":m,"macd_signal":ms,"macd_hist":mh,
@@ -268,7 +338,10 @@ def build_indicators(prices,candles=None):
             "williams_r":calc_williams_r(prices),"cci":calc_cci(prices),
             "vwap":round(sum(prices[-20:])/20,2),
             "momentum":calc_momentum(prices),"momentum_5":calc_momentum(prices,5),
-            "poc":poc,"vah":vah,"val":val}
+            "poc":poc,"vah":vah,"val":val,
+            # ─── NEU (Bild 4) ───
+            "ichimoku":ichimoku,"support":supres.get("support"),"resistance":supres.get("resistance"),
+            "key_level":supres.get("key_level"),"key_level_type":supres.get("key_level_type")}
 
 # ═══════════════════════════════════════════════════════
 # TREND + WOCHE + INTERMARKET
@@ -341,6 +414,146 @@ def update_intermarket():
         dc=bot_state["dxy_prices"][-1]-bot_state["dxy_prices"][-5]
         if dc!=0: bot_state["gold_dxy_correlation"]=round(gc/abs(dc)*-0.1,2)
     add_log(f"Intermarket: DXY={dxy} ({bot_state['dxy_trend']}) | Yields={yields}%","INFO")
+
+# ═══════════════════════════════════════════════════════
+# SENTIMENT & MAKRO-MODUL (Bilder 1, 2, 4)
+# ═══════════════════════════════════════════════════════
+# Transparenz-Hinweis: DXY, 10Y-Yields, Real-Yields-Proxy und die Fed-Erwartung
+# werden automatisch aus frei verfügbaren Marktdaten berechnet. Reuters/Bloomberg-
+# Sentiment, Fed-FOMC-Wortlaut, LBMA/WGC-Zentralbank-Käufe und echte CPI/PCE-Releases
+# benötigen kostenpflichtige bzw. registrierungspflichtige Datenfeeds und können hier
+# NICHT live gezogen werden — diese Felder sind daher manuell über /sentiment (POST)
+# pflegbar (z.B. wenn du die monatlichen CPI-Zahlen liest, trägst du sie dort ein).
+# Der CFTC-CoT-Bericht ist frei (cftc.gov), der Abruf ist aber best-effort/experimentell,
+# da das Format strikt fixiert ist und ohne Live-Netzwerktest hier nicht 100% verifiziert
+# werden konnte — bei Fehlern fällt das System automatisch auf "manuell" zurück.
+
+INFLATION_EXPECTATION_BASELINE=2.3  # langfristige Annahme für Real-Yield-Proxy (10Y nominal - Erwartung)
+
+def fetch_real_yields_proxy():
+    """
+    Real Yields (TIPS-Proxy) — Bild 4 zeigt 'US Real Yields (TIPS)'.
+    Echte 10Y-TIPS-Realrenditen sind nicht über die kostenlose Yahoo-API verfügbar.
+    Proxy: Nominal-10Y-Yield minus langfristige Inflationserwartung (Baseline).
+    """
+    nominal=bot_state.get("yields_10y")
+    if nominal is None: return None
+    return round(nominal-INFLATION_EXPECTATION_BASELINE,2)
+
+def calc_fed_rate_expectation():
+    """
+    Fed-Zins-Erwartung — Proxy aus dem Trend der 10Y-Yields (keine echten Fed-Funds-Futures-Daten).
+    Fallende Yields werden am Markt häufig als Vorbote für Zinssenkungs-Erwartungen gelesen.
+    """
+    yt=bot_state.get("yields_trend","—")
+    if "FALL" in yt:
+        return {"status":"Senkung erwartet (Proxy)","note":f"10Y Yields fallen ({yt}) → Markt preist Lockerung ein","bullish":True}
+    elif "STEIG" in yt:
+        return {"status":"Straffung / Hawkish (Proxy)","note":f"10Y Yields steigen ({yt}) → Markt preist weniger/keine Senkung ein","bullish":False}
+    return {"status":"Unverändert (Proxy)","note":"Keine klare Yield-Tendenz erkennbar","bullish":None}
+
+def fetch_cot_gold():
+    """
+    Best-effort Versuch, den freien wöchentlichen CFTC Commitment-of-Traders Bericht
+    für Gold (COMEX) abzurufen und eine Netto-Spekulanten-Position (% Long) zu berechnen.
+    EXPERIMENTELL: CFTC liefert ein striktes Spaltenformat (Legacy Short Format). Da in
+    dieser Umgebung kein Live-Netzwerktest möglich war, ist dieser Parser defensiv
+    abgesichert — bei jeder Unstimmigkeit (Format, Wertebereich) wird None zurückgegeben
+    und das System fällt automatisch auf "manuell" zurück. Bitte nach dem ersten Deploy
+    einmal verifizieren, ob die Werte plausibel sind.
+    """
+    url="https://www.cftc.gov/dea/newcot/deafut.txt"
+    try:
+        req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
+        with urllib.request.urlopen(req,timeout=10) as r:
+            txt=r.read().decode("utf-8",errors="ignore")
+        for line in txt.splitlines():
+            if line.upper().startswith('"GOLD - COMMODITY EXCHANGE INC.') or line.upper().startswith("GOLD - COMMODITY EXCHANGE INC."):
+                parts=[p.strip().strip('"') for p in line.split(",")]
+                # Legacy Short Format Spaltenreihenfolge (CFTC-Doku):
+                # [7]=Open_Interest_All [8]=NonComm_Long_All [9]=NonComm_Short_All
+                if len(parts)>10:
+                    noncomm_long=float(parts[8]); noncomm_short=float(parts[9])
+                    total=noncomm_long+noncomm_short
+                    if total>0:
+                        pct=round(noncomm_long/total*100,1)
+                        if 0<=pct<=100: return pct
+                return None
+        return None
+    except Exception as e:
+        add_log(f"CoT-Abruf fehlgeschlagen (best-effort, fällt auf manuell zurück): {e}","WARN")
+        return None
+
+def update_sentiment_analysis():
+    """Führt die automatisch berechenbaren Sentiment-Faktoren zusammen und bildet den Gesamt-Score."""
+    sent=bot_state["sentiment"]
+    score=50.0; notes=[]
+
+    # Real Yields Proxy
+    ry=fetch_real_yields_proxy()
+    if ry is not None:
+        prev=sent.get("real_yields_proxy"); sent["real_yields_proxy"]=ry
+        sent["real_yields_prev"]=prev
+        if prev is not None:
+            if ry<prev: sent["real_yields_status"]="FALLEND (stützt Gold)"; score+=10; notes.append(f"Real Yields Proxy fällt ({ry}%) → stützt Gold")
+            elif ry>prev: sent["real_yields_status"]="STEIGEND (Druck)"; score-=10; notes.append(f"Real Yields Proxy steigt ({ry}%) → Druck auf Gold")
+            else: sent["real_yields_status"]="UNVERÄNDERT"
+        else:
+            sent["real_yields_status"]=f"{ry}% (Proxy)"
+
+    # Fed-Erwartung
+    fed=calc_fed_rate_expectation(); sent["fed_rate_expectation"]=fed
+    if fed.get("bullish") is True:  score+=10; notes.append("Fed-Proxy: Senkungserwartung → bullisch")
+    elif fed.get("bullish") is False: score-=10; notes.append("Fed-Proxy: Hawkish → bärisch")
+
+    # DXY (bereits anderswo erfasst, hier nur für den Sentiment-Score gewichtet)
+    dxt=bot_state.get("dxy_trend","—")
+    if "FÄLLT" in dxt: score+=10; notes.append("DXY fällt → bullisch für Gold")
+    elif "STEIGT" in dxt: score-=10; notes.append("DXY steigt → bärisch für Gold")
+
+    # CoT-Bericht (best-effort automatisch, sonst bleibt der zuletzt manuell gesetzte Wert erhalten)
+    cot_pct=fetch_cot_gold()
+    if cot_pct is not None:
+        sent["cot_report"]={"net_long_pct":cot_pct,"status":f"{cot_pct}% Netto-Long (Spekulanten)",
+                             "note":"Automatisch via CFTC.gov (best-effort)","manual":False,
+                             "updated":datetime.datetime.utcnow().strftime("%d.%m.%Y %H:%M UTC")}
+        sent["data_sources"]["CFTC COT Reports"]="AKTIV (auto)"
+        if cot_pct>=65: score+=5; notes.append(f"CoT: {cot_pct}% Netto-Long → stark bullisch positioniert")
+        elif cot_pct<=35: score-=5; notes.append(f"CoT: {cot_pct}% Netto-Long → stark bärisch positioniert")
+    else:
+        sent["data_sources"]["CFTC COT Reports"]="MANUELL (Abruf fehlgeschlagen)"
+        existing_cot=sent.get("cot_report",{}).get("net_long_pct")
+        if existing_cot is not None:
+            if existing_cot>=65: score+=5; notes.append(f"CoT (manuell): {existing_cot}% Netto-Long → bullisch")
+            elif existing_cot<=35: score-=5; notes.append(f"CoT (manuell): {existing_cot}% Netto-Long → bärisch")
+
+    # Manuell gepflegte Faktoren (Geopolitik, CPI/PCE, Zentralbank-Käufe, Retail-Sentiment)
+    geo=sent.get("geopolitical_risk",{})
+    if geo.get("level")=="ERHÖHT": score+=10; notes.append("Geopolitisches Risiko ERHÖHT (manuell) → bullisch (Safe Haven)")
+    elif geo.get("level")=="GERING": score-=5; notes.append("Geopolitisches Risiko GERING (manuell) → leicht bärisch")
+
+    cpi=sent.get("cpi_pce_inflation",{})
+    if cpi.get("trend")=="ERHÖHT": score+=5; notes.append("CPI/PCE Inflation ERHÖHT (manuell) → bullisch (Inflationsschutz)")
+    elif cpi.get("trend")=="GEFALLEN": score-=5; notes.append("CPI/PCE Inflation GEFALLEN (manuell) → bärisch")
+
+    cb=sent.get("central_bank_buying",{})
+    if cb.get("status")=="STARK": score+=10; notes.append("Zentralbank-Käufe STARK (manuell) → bullisch")
+    elif cb.get("status")=="SCHWACH": score-=5; notes.append("Zentralbank-Käufe SCHWACH (manuell) → leicht bärisch")
+
+    retail=sent.get("retail_sentiment",{})
+    rb=retail.get("bullish_pct")
+    if rb is not None:
+        if rb>=70: score-=3; notes.append(f"Retail-Sentiment {rb}% bullish → Kontraindikator (zu euphorisch)")
+        elif rb<=30: score+=3; notes.append(f"Retail-Sentiment {rb}% bullish → Kontraindikator (zu pessimistisch)")
+
+    score=max(0.0,min(100.0,round(score,1)))
+    sent["overall_sentiment_pct"]=score
+    if score>=65:   sent["overall_sentiment_label"]="BULLISH 🟢"
+    elif score<=35: sent["overall_sentiment_label"]="BEARISH 🔴"
+    else:           sent["overall_sentiment_label"]="NEUTRAL ⚪"
+    sent["overall_sentiment_notes"]=notes[:8]
+    sent["last_updated"]=datetime.datetime.utcnow().strftime("%H:%M:%S UTC")
+    add_log(f"Sentiment: {sent['overall_sentiment_label']} ({score}%) | Real Yields Proxy:{ry} | Fed:{fed.get('status')}","INFO")
 
 # ═══════════════════════════════════════════════════════
 # NEWS-SPERRE
@@ -1343,7 +1556,7 @@ def analysis_loop():
         try:
             cycle+=1; bot_state["learning"]["cycle"]=cycle; bot_state["session"]=get_session()
             i_cycle+=1
-            if i_cycle>=6 or cycle==1: i_cycle=0; update_intermarket()
+            if i_cycle>=6 or cycle==1: i_cycle=0; update_intermarket(); update_sentiment_analysis()
             c_cycle+=1
             if c_cycle>=3 or cycle==1:
                 c_cycle=0
@@ -1541,6 +1754,7 @@ td{padding:7px 8px;border-bottom:1px solid #0d1420;font-variant-numeric:tabular-
   <button class="tab tab-bo"        onclick="showTab('t-bo',this)">🟡 Breakout</button>
   <button class="tab tab-ms"        onclick="showTab('t-ms',this)">🟣 Macro Struktur</button>
   <button class="tab"               onclick="showTab('t-willy',this)" style="border-color:#f59e0b">⭐ WillyAlgoTrader</button>
+  <button class="tab"               onclick="showTab('t-sent',this)" style="border-color:#2dd4bf">🌐 Sentiment &amp; Makro</button>
   <button class="tab tab-st"        onclick="showTab('t-stats',this)">📈 Statistiken</button>
 </div>
 
@@ -1973,6 +2187,97 @@ td{padding:7px 8px;border-bottom:1px solid #0d1420;font-variant-numeric:tabular-
 </div><!-- /t-willy -->
 
 <!-- ══════════════════════════════════════
+     TAB: SENTIMENT & MAKRO (NEU — Bilder 1,2,4)
+══════════════════════════════════════ -->
+<div id="t-sent" class="tc">
+<div class="sec">🌐 Markt-Analyse &amp; Makro-Sentiment — Datenbasis, Intermarket &amp; Stimmungsindikatoren</div>
+
+<div class="g2">
+  <!-- LINKS: Markt-Analyse mit Unterreitern (Bild 4 linke Seite) -->
+  <div class="pn">
+    <div class="tabs" style="margin-bottom:10px">
+      <button class="tab active" style="padding:6px 12px;font-size:12px" onclick="showSubTab('sub-trend',this)">TREND</button>
+      <button class="tab" style="padding:6px 12px;font-size:12px" onclick="showSubTab('sub-mom',this)">MOMENTUM</button>
+      <button class="tab" style="padding:6px 12px;font-size:12px" onclick="showSubTab('sub-vola',this)">VOLATILITÄT</button>
+      <button class="tab" style="padding:6px 12px;font-size:12px" onclick="showSubTab('sub-vol',this)">VOLUMEN</button>
+    </div>
+
+    <div id="sub-trend" class="subtc">
+      <div class="row"><span class="rk">EMA 20</span><span class="rv" id="sn-ema20">—</span></div>
+      <div class="row"><span class="rk">EMA 50</span><span class="rv" id="sn-ema50">—</span></div>
+      <div class="row"><span class="rk">EMA 200</span><span class="rv" id="sn-ema200">—</span></div>
+      <div class="row"><span class="rk">Ichimoku Tenkan/Kijun</span><span class="rv" id="sn-ichi-tk">—</span></div>
+      <div class="row"><span class="rk">Ichimoku Wolke</span><span class="rv" id="sn-ichi-cloud">—</span></div>
+      <div class="row"><span class="rk">VWAP</span><span class="rv" id="sn-vwap">—</span></div>
+      <div class="row"><span class="rk">Sup/Res (Key Level)</span><span class="rv" id="sn-supres">—</span></div>
+      <div class="row"><span class="rk">Fib 61.8%</span><span class="rv" id="sn-fib">—</span></div>
+    </div>
+
+    <div id="sub-mom" class="subtc" style="display:none">
+      <div class="row"><span class="rk">RSI (14)</span><span class="rv" id="sn-rsi">—</span></div>
+      <div class="row"><span class="rk">MACD / Signal</span><span class="rv" id="sn-macd">—</span></div>
+      <div class="row"><span class="rk">Momentum 10/5</span><span class="rv" id="sn-mom">—</span></div>
+      <div class="row"><span class="rk">CCI</span><span class="rv" id="sn-cci">—</span></div>
+      <div class="row"><span class="rk">Williams %R</span><span class="rv" id="sn-wr">—</span></div>
+      <div class="row"><span class="rk">Stochastic K/D</span><span class="rv" id="sn-stoch">—</span></div>
+    </div>
+
+    <div id="sub-vola" class="subtc" style="display:none">
+      <div class="row"><span class="rk">ATR (14)</span><span class="rv" id="sn-atr">—</span></div>
+      <div class="row"><span class="rk">ADX</span><span class="rv" id="sn-adx">—</span></div>
+      <div class="row"><span class="rk">Bollinger O/M/U</span><span class="rv" id="sn-bb">—</span></div>
+      <div style="font-size:11px;color:var(--ft);margin-top:8px">Höherer ATR → größerer dynamischer Stop-Loss &amp; kleinere Positionsgröße (siehe Risiko-Management)</div>
+    </div>
+
+    <div id="sub-vol" class="subtc" style="display:none">
+      <div class="row"><span class="rk">POC (Volumen-Hotspot)</span><span class="rv amr" id="sn-poc">—</span></div>
+      <div class="row"><span class="rk">VAH / VAL</span><span class="rv" id="sn-vah-val">—</span></div>
+      <div style="font-size:11px;color:var(--ft);margin-top:8px">Volumen-Filter verhindert Fake-Ausbrüche (siehe Breakout-Strategie, Tab 🟡)</div>
+    </div>
+  </div>
+
+  <!-- RECHTS: Sentiment-Panel (Bild 4 rechte Seite) -->
+  <div class="pn">
+    <div class="pt"><span class="dot dc pulse"></span>Sentiment &amp; Makro-Faktoren</div>
+    <div class="row"><span class="rk">DXY (USD-Stärke)</span><span class="rv amr" id="sn-dxy">—</span></div>
+    <div class="pb"><div class="pf pr" id="sn-dxy-bar" style="width:50%"></div></div>
+    <div class="row"><span class="rk">US Real Yields (TIPS-Proxy)</span><span class="rv" id="sn-ry">—</span></div>
+    <div class="pb"><div class="pf pr" id="sn-ry-bar" style="width:50%"></div></div>
+    <div class="row"><span class="rk">Geopolitisches Risiko</span><span class="rv" id="sn-geo">—</span></div>
+    <div class="pb"><div class="pf pg" id="sn-geo-bar" style="width:50%"></div></div>
+    <div class="row"><span class="rk">Fed Zins-Erwartung</span><span class="rv" id="sn-fed">—</span></div>
+    <div class="pb"><div class="pf pg" id="sn-fed-bar" style="width:50%"></div></div>
+    <div class="row"><span class="rk">CPI/PCE Inflation</span><span class="rv" id="sn-cpi">—</span></div>
+    <div class="pb"><div class="pf pg" id="sn-cpi-bar" style="width:50%"></div></div>
+    <div class="row"><span class="rk">Zentralbank-Käufe</span><span class="rv" id="sn-cb">—</span></div>
+    <div class="pb"><div class="pf pg" id="sn-cb-bar" style="width:50%"></div></div>
+    <div class="row"><span class="rk">CoT Netto-Long (Spekulanten)</span><span class="rv" id="sn-cot">—</span></div>
+    <div class="row"><span class="rk">Retail-Sentiment (bullish)</span><span class="rv" id="sn-retail">—</span></div>
+
+    <div style="margin-top:12px;border-top:1px solid var(--bd);padding-top:10px">
+      <div class="lbl">GESAMT-SENTIMENT</div>
+      <div style="display:flex;align-items:center;gap:10px;margin:4px 0">
+        <div class="big" id="sn-overall-pct">50%</div>
+        <div class="sv" id="sn-overall-label">NEUTRAL ⚪</div>
+      </div>
+      <div class="pb"><div class="pf pg" id="sn-overall-bar" style="width:50%"></div></div>
+      <div id="sn-notes" style="font-size:12px;color:var(--dm);line-height:1.7;margin-top:6px">—</div>
+    </div>
+  </div>
+</div>
+
+<div class="sec">Aktive Datenquellen</div>
+<div class="pn" style="margin-bottom:12px">
+  <div id="sn-sources" style="display:flex;flex-wrap:wrap;gap:8px">—</div>
+  <div style="font-size:11px;color:var(--ft);margin-top:10px;line-height:1.6">
+    DXY · 10Y-Yields · Real-Yields-Proxy · Fed-Erwartung und CoT-Bericht werden automatisch berechnet/abgerufen.
+    Reuters/Bloomberg, Fed-FOMC-Wortlaut, LBMA/WGC-Zentralbank-Käufe, echte CPI/PCE-Releases und Retail-Sentiment
+    benötigen kostenpflichtige/registrierungspflichtige Feeds und werden über <code>POST /sentiment</code> manuell gepflegt.
+  </div>
+</div>
+</div><!-- /t-sent -->
+
+<!-- ══════════════════════════════════════
      TAB: STATISTIKEN
 ══════════════════════════════════════ -->
 <div id="t-stats" class="tc">
@@ -2061,6 +2366,14 @@ function showTab(id,btn){
   document.querySelectorAll('.tc').forEach(t=>t.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
   document.getElementById(id).classList.add('active');
+  btn.classList.add('active');
+}
+
+function showSubTab(id,btn){
+  const parent=btn.closest('.pn');
+  parent.querySelectorAll('.subtc').forEach(t=>t.style.display='none');
+  parent.querySelectorAll('.tabs .tab').forEach(b=>b.classList.remove('active'));
+  document.getElementById(id).style.display='block';
   btn.classList.add('active');
 }
 
@@ -2501,6 +2814,72 @@ async function refresh(){
       `<div class="le" style="color:${lc[l.level]||'var(--bl)'}"><span class="t">${l.time}</span>[${l.level}] ${l.msg}</div>`
     ).join('');
 
+    // ── TAB: SENTIMENT & MAKRO ──
+    const sn=d.sentiment||{}; const ichi=(i.ichimoku)||{};
+    document.getElementById('sn-ema20').textContent=fmt(i.ema20);
+    document.getElementById('sn-ema50').textContent=fmt(i.ema50);
+    document.getElementById('sn-ema200').textContent=fmt(i.ema200);
+    document.getElementById('sn-ichi-tk').textContent=ichi.tenkan?`${ichi.tenkan} / ${ichi.kijun} (${ichi.tk_cross||'—'})`:'—';
+    const icEl=document.getElementById('sn-ichi-cloud');
+    icEl.textContent=ichi.cloud_status||'—';
+    icEl.className='rv '+(ichi.label==='BULLISH'?'pos':ichi.label==='BEARISH'?'neg':'neu');
+    document.getElementById('sn-vwap').textContent=fmt(i.vwap);
+    document.getElementById('sn-supres').textContent=i.key_level?`${i.key_level_type==='RESISTANCE'?'Widerstand':'Unterstützung'} @ ${i.key_level}`:'—';
+    const fibv=(d.weekly_analysis&&d.weekly_analysis.key_levels||[]).find(k=>k.includes('Fib 61.8'));
+    document.getElementById('sn-fib').textContent=fibv||'—';
+    document.getElementById('sn-rsi').textContent=fmt(i.rsi);
+    document.getElementById('sn-macd').textContent=`${fmt(i.macd)} / ${fmt(i.macd_signal)}`;
+    document.getElementById('sn-mom').textContent=`${fmt(i.momentum)} / ${fmt(i.momentum_5)}`;
+    document.getElementById('sn-cci').textContent=fmt(i.cci);
+    document.getElementById('sn-wr').textContent=fmt(i.williams_r);
+    document.getElementById('sn-stoch').textContent=`${fmt(i.stoch_k)} / ${fmt(i.stoch_d)}`;
+    document.getElementById('sn-atr').textContent=fmt(i.atr);
+    document.getElementById('sn-adx').textContent=fmt(i.adx);
+    document.getElementById('sn-bb').textContent=`${fmt(i.bb_upper)} / ${fmt(i.bb_mid)} / ${fmt(i.bb_lower)}`;
+    document.getElementById('sn-poc').textContent=fmt(i.poc);
+    document.getElementById('sn-vah-val').textContent=`${fmt(i.vah)} / ${fmt(i.val)}`;
+
+    // Sentiment-Panel rechts
+    document.getElementById('sn-dxy').textContent=dx?dx.toFixed(2)+' · '+(dt||'—'):'—';
+    document.getElementById('sn-dxy-bar').style.width=(dt&&dt.includes('STEIGT')?75:dt&&dt.includes('FÄLLT')?25:50)+'%';
+    const ry=sn.real_yields_proxy;
+    document.getElementById('sn-ry').textContent=ry!==null&&ry!==undefined?ry+'% · '+(sn.real_yields_status||'—'):'Noch keine Daten';
+    document.getElementById('sn-ry-bar').style.width=(sn.real_yields_status&&sn.real_yields_status.includes('STEIGEND')?75:sn.real_yields_status&&sn.real_yields_status.includes('FALLEND')?25:50)+'%';
+    const geo=sn.geopolitical_risk||{};
+    document.getElementById('sn-geo').textContent=(geo.level||'NEUTRAL')+(geo.manual?' (manuell)':'');
+    document.getElementById('sn-geo-bar').style.width=(geo.level==='ERHÖHT'?80:geo.level==='GERING'?20:50)+'%';
+    const fed=sn.fed_rate_expectation||{};
+    document.getElementById('sn-fed').textContent=fed.status||'—';
+    document.getElementById('sn-fed-bar').style.width=(fed.bullish===true?75:fed.bullish===false?25:50)+'%';
+    const cpi=sn.cpi_pce_inflation||{};
+    document.getElementById('sn-cpi').textContent=cpi.trend?cpi.trend+(cpi.value?` (${cpi.value}%)`:'')+' (manuell)':'Noch keine Daten';
+    document.getElementById('sn-cpi-bar').style.width=(cpi.trend==='ERHÖHT'?75:cpi.trend==='GEFALLEN'?25:50)+'%';
+    const cb=sn.central_bank_buying||{};
+    document.getElementById('sn-cb').textContent=cb.status?cb.status+' (manuell)':'Noch keine Daten';
+    document.getElementById('sn-cb-bar').style.width=(cb.status==='STARK'?80:cb.status==='SCHWACH'?20:50)+'%';
+    const cot=sn.cot_report||{};
+    document.getElementById('sn-cot').textContent=cot.net_long_pct!==null&&cot.net_long_pct!==undefined?cot.net_long_pct+'%'+(cot.manual?' (manuell)':' (auto)'):'Noch keine Daten';
+    const retail=sn.retail_sentiment||{};
+    document.getElementById('sn-retail').textContent=retail.bullish_pct!==null&&retail.bullish_pct!==undefined?retail.bullish_pct+'% (manuell)':'Noch keine Daten';
+
+    const ov_pct=sn.overall_sentiment_pct!==undefined?sn.overall_sentiment_pct:50;
+    const ovEl=document.getElementById('sn-overall-pct');
+    ovEl.textContent=ov_pct+'%'; ovEl.className='big '+(ov_pct>=65?'pos':ov_pct<=35?'neg':'amr');
+    document.getElementById('sn-overall-label').textContent=sn.overall_sentiment_label||'NEUTRAL ⚪';
+    document.getElementById('sn-overall-bar').style.width=ov_pct+'%';
+    document.getElementById('sn-overall-bar').className='pf '+(ov_pct>=65?'pg':ov_pct<=35?'pr':'pa');
+    document.getElementById('sn-notes').innerHTML=(sn.overall_sentiment_notes||[]).map(n=>`→ ${n}`).join('<br>')||'Noch keine Begründungen — warte auf Daten';
+
+    const srcs=sn.data_sources||{};
+    document.getElementById('sn-sources').innerHTML=Object.keys(srcs).length
+      ?Object.entries(srcs).map(([k,v])=>{
+        const active=v&&v.toString().toUpperCase().includes('AKTIV');
+        const manual=v&&v.toString().toUpperCase().includes('MANUELL');
+        const cls=active?'bg':manual?'ba':'br';
+        return `<span class="b ${cls}">${k}: ${v}</span>`;
+      }).join('')
+      :'—';
+
   }catch(e){console.error('Refresh-Fehler:',e);}
   setTimeout(refresh,10000);
 }
@@ -2541,6 +2920,7 @@ def state():
         "news_lock":bot_state["news_lock"],"news_lock_reason":bot_state["news_lock_reason"],
         "demo_account":get_demo_snapshot(),
         "willy_analytics":bot_state["willy_analytics"],
+        "sentiment":bot_state["sentiment"],
     })
 
 @app.route("/trades")
@@ -2557,6 +2937,42 @@ def demo_r(): return jsonify(get_demo_snapshot())
 def macro_r(): return jsonify(bot_state["macro_state"])
 @app.route("/guardrails")
 def guardrails_r(): return jsonify(bot_state["guardrails"])
+
+@app.route("/sentiment",methods=["GET"])
+def sentiment_get(): return jsonify(bot_state["sentiment"])
+
+@app.route("/sentiment",methods=["POST"])
+def sentiment_post():
+    """
+    Manuelles Update der Sentiment-Faktoren, die keine freie Echtzeit-API haben
+    (Bild 1/2/4: Geopolitisches Risiko, CPI/PCE Inflation, Zentralbank-Käufe,
+    Retail-/CoT-Sentiment). Beispiel-Body:
+    {"geopolitical_risk":"ERHÖHT","cpi_pce_trend":"ERHÖHT","cpi_pce_value":3.4,
+     "central_bank_buying":"STARK","retail_bullish_pct":62,"cot_net_long_pct":58}
+    """
+    data=request.get_json(force=True); sent=bot_state["sentiment"]; now=datetime.datetime.utcnow().strftime("%d.%m.%Y %H:%M UTC")
+    if "geopolitical_risk" in data:
+        sent["geopolitical_risk"]={"level":str(data["geopolitical_risk"]).upper(),
+            "note":data.get("geopolitical_note","Manuell gesetzt"),"manual":True,"updated":now}
+        sent["data_sources"]["Reuters / Bloomberg"]="MANUELL (zuletzt aktualisiert)"
+    if "cpi_pce_trend" in data or "cpi_pce_value" in data:
+        sent["cpi_pce_inflation"]={"value":data.get("cpi_pce_value",sent["cpi_pce_inflation"].get("value")),
+            "trend":str(data.get("cpi_pce_trend",sent["cpi_pce_inflation"].get("trend",""))).upper(),
+            "note":data.get("cpi_pce_note","Manuell gesetzt"),"manual":True,"updated":now}
+    if "central_bank_buying" in data:
+        sent["central_bank_buying"]={"status":str(data["central_bank_buying"]).upper(),
+            "note":data.get("central_bank_note","Manuell gesetzt"),"manual":True,"updated":now}
+        sent["data_sources"]["LBMA / WGC Data"]="MANUELL (zuletzt aktualisiert)"
+    if "retail_bullish_pct" in data:
+        sent["retail_sentiment"]={"bullish_pct":float(data["retail_bullish_pct"]),
+            "note":data.get("retail_note","Manuell gesetzt"),"updated":now}
+        sent["data_sources"]["Macroaxis / Investing.com"]="MANUELL (zuletzt aktualisiert)"
+    if "cot_net_long_pct" in data:
+        sent["cot_report"]={"net_long_pct":float(data["cot_net_long_pct"]),
+            "status":f"{data['cot_net_long_pct']}% Netto-Long (manuell)","note":"Manuell gesetzt","manual":True,"updated":now}
+    update_sentiment_analysis()
+    add_log("Sentiment-Faktoren manuell aktualisiert","INFO")
+    return jsonify({"status":"ok","sentiment":bot_state["sentiment"]})
 
 @app.route("/news",methods=["POST"])
 def add_news():
