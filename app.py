@@ -1,9 +1,15 @@
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
-import datetime, threading, time, math, json, urllib.request, random
+import datetime, threading, time, math, json, urllib.request
 
 app = Flask(__name__)
 CORS(app)
+state_lock = threading.Lock()
+
+# Demo: typischer XAUUSD-Spread in Punkten (SL/TP etwas konservativer)
+SPREAD_PTS = 0.30
+TP_PARTIAL_PCT = (0.33, 0.33, 0.34)
+LOOP_INTERVAL_SEC = 60
 
 # ═══════════════════════════════════════════════════════
 # GLOBALER ZUSTAND v4.0
@@ -12,7 +18,9 @@ def _def_strat_stats():
     return {"trades":0,"wins":0,"losses":0,"pnl":0.0,"eur_pnl":0.0,"best":0.0,"worst":0.0,"win_rate":0.0}
 
 bot_state = {
-    "price":None,"prices":[],"price_source":"XAUUSD Spot (Yahoo Finance ~ OANDA Referenzpreis)",
+    "price":None,"price_stale":False,"prices":[],"price_source":"XAUUSD Spot (Yahoo Finance ~ OANDA Referenzpreis)",
+    "data_quality":{"candles_1h":0,"candles_4h":0,"candles_1d":0,"last_candle_fetch":"—"},
+    "breakout_meta":{"volume_ratio":null},
     "candles":{},
     "dxy":None,"dxy_prices":[],"dxy_prev":None,"dxy_trend":"—",
     "yields_10y":None,"yields_prev":None,"yields_trend":"—",
@@ -156,9 +164,14 @@ def fetch_price():
             d=yahoo_fetch(t)
             if d:
                 p=float(d["chart"]["result"][0]["meta"]["regularMarketPrice"])
-                if 1500<p<6000: return round(p,2)
+                if 1500<p<6000:
+                    bot_state["price_stale"]=False
+                    return round(p,2)
         except: continue
-    if bot_state["prices"]: return round(bot_state["prices"][-1]+random.uniform(-0.5,0.5),2)
+    if bot_state["prices"]:
+        bot_state["price_stale"]=True
+        return round(bot_state["prices"][-1], 2)
+    bot_state["price_stale"]=True
     return None
 
 def fetch_dxy():
@@ -179,12 +192,9 @@ def fetch_yields():
     except: pass
     return None
 
-def fetch_candles(interval="1h",count=80):
-    mp={"1h":("1h","30d"),"4h":("1h","60d"),"1d":("1d","365d")}
-    yi,yr=mp.get(interval,("1h","30d"))
+def _parse_yahoo_candles(d):
+    if not d: return []
     try:
-        d=yahoo_fetch("XAUUSD%3DX",yi,yr)
-        if not d: return []
         res=d["chart"]["result"][0]; ts=res["timestamp"]; q=res["indicators"]["quote"][0]
         out=[]
         for i in range(len(ts)):
@@ -193,9 +203,44 @@ def fetch_candles(interval="1h",count=80):
                    "low":round(q["low"][i] or 0,2),"close":round(q["close"][i] or 0,2),"volume":int(q["volume"][i] or 0)}
                 if 1500<c["close"]<6000: out.append(c)
             except: continue
-        return out[-count:] if len(out)>count else out
+        return out
+    except: return []
+
+def aggregate_candles(candles,n=4):
+    """Aggregiert n Kerzen (z.B. 4×1h → 4h)."""
+    if not candles or n<2: return list(candles or [])
+    out=[]
+    usable=len(candles)-(len(candles)%n)
+    for i in range(0,usable,n):
+        chunk=candles[i:i+n]
+        if len(chunk)<n: break
+        out.append({"time":chunk[0]["time"],"open":chunk[0]["open"],
+            "high":max(c["high"] for c in chunk),"low":min(c["low"] for c in chunk),
+            "close":chunk[-1]["close"],"volume":sum(c["volume"] for c in chunk)})
+    return out
+
+def fetch_candles(interval="1h",count=80):
+    try:
+        if interval=="4h":
+            raw=_parse_yahoo_candles(yahoo_fetch("XAUUSD%3DX","1h","60d"))
+            agg=aggregate_candles(raw,4)
+            return agg[-count:] if len(agg)>count else agg
+        mp={"1h":("1h","30d"),"1d":("1d","365d")}
+        yi,yr=mp.get(interval,("1h","30d"))
+        raw=_parse_yahoo_candles(yahoo_fetch("XAUUSD%3DX",yi,yr))
+        return raw[-count:] if len(raw)>count else raw
     except Exception as e:
         add_log(f"Kerzen-Fehler ({interval}): {e}","WARN"); return []
+
+def calc_pearson_corr(a,b):
+    n=min(len(a),len(b))
+    if n<5: return None
+    xs,ys=a[-n:],b[-n:]
+    mx,my=sum(xs)/n,sum(ys)/n
+    num=sum((xs[i]-mx)*(ys[i]-my) for i in range(n))
+    dx=math.sqrt(sum((x-mx)**2 for x in xs)); dy=math.sqrt(sum((y-my)**2 for y in ys))
+    if dx==0 or dy==0: return None
+    return round(num/(dx*dy),2)
 
 # ═══════════════════════════════════════════════════════
 # INDIKATOREN
@@ -214,16 +259,29 @@ def calc_rsi(p,n=14):
     ag=sum(g[-n:])/n; al=sum(l[-n:])/n
     return round(100-(100/(1+ag/al)),2) if al else 100.0
 
-def calc_macd(p):
-    if len(p)<26: return None,None,None
-    e12=calc_ema(p,12); e26=calc_ema(p,26)
-    if not e12 or not e26: return None,None,None
-    m=round(e12-e26,2); s=round(m*0.85,2); return m,s,round(m-s,2)
+def calc_macd(closes):
+    if len(closes)<26: return None,None,None
+    def ema_series(data,n):
+        k=2.0/(n+1); s=[data[0]]
+        for x in data[1:]: s.append(x*k+s[-1]*(1-k))
+        return s
+    e12=ema_series(closes,12); e26=ema_series(closes,26)
+    macd=[round(e12[i]-e26[i],4) for i in range(len(closes))]
+    sig=ema_series(macd,9)
+    m=round(macd[-1],2); s=round(sig[-1],2)
+    return m,s,round(m-s,2)
 
 def calc_bollinger(p,n=20):
     if len(p)<n: return None,None,None
     s=p[-n:]; mid=sum(s)/n; std=math.sqrt(sum((x-mid)**2 for x in s)/n)
     return round(mid-2*std,2),round(mid,2),round(mid+2*std,2)
+
+def calc_stoch_candles(candles,n=14):
+    if len(candles)<n: return None,None
+    sub=candles[-n:]; lo=min(c["low"] for c in sub); hi=max(c["high"] for c in sub)
+    cl=sub[-1]["close"]
+    if hi==lo: return 50.0,50.0
+    k=round((cl-lo)/(hi-lo)*100,2); return k,round(k*0.9,2)
 
 def calc_stoch(p,n=14):
     if len(p)<n: return None,None
@@ -231,16 +289,59 @@ def calc_stoch(p,n=14):
     if hi==lo: return 50.0,50.0
     k=round((p[-1]-lo)/(hi-lo)*100,2); return k,round(k*0.9,2)
 
+def calc_atr_candles(candles,n=14):
+    if len(candles)<n+1: return None
+    trs=[]
+    for i in range(1,len(candles)):
+        c,prev=candles[i],candles[i-1]
+        tr=max(c["high"]-c["low"],abs(c["high"]-prev["close"]),abs(c["low"]-prev["close"]))
+        trs.append(tr)
+    return round(sum(trs[-n:])/n,2)
+
 def calc_atr(p,n=14):
     if len(p)<n+1: return None
     trs=[abs(p[i]-p[i-1]) for i in range(1,len(p))]
     return round(sum(trs[-n:])/n,2)
+
+def calc_adx_candles(candles,n=14):
+    if len(candles)<n*2+1: return None
+    plus_dm=[]; minus_dm=[]; trs=[]
+    for i in range(1,len(candles)):
+        up=candles[i]["high"]-candles[i-1]["high"]
+        dn=candles[i-1]["low"]-candles[i]["low"]
+        plus_dm.append(up if up>dn and up>0 else 0)
+        minus_dm.append(dn if dn>up and dn>0 else 0)
+        c,prev=candles[i],candles[i-1]
+        trs.append(max(c["high"]-c["low"],abs(c["high"]-prev["close"]),abs(c["low"]-prev["close"])))
+    def wilder(arr):
+        s=sum(arr[:n]); out=[s]
+        for v in arr[n:]: s=s-(s/n)+v; out.append(s)
+        return out
+    tr14=wilder(trs); pdm=wilder(plus_dm); mdm=wilder(minus_dm)
+    dxs=[]
+    for i in range(len(tr14)):
+        if tr14[i]<=0: continue
+        pdi=100*pdm[i]/tr14[i]; mdi=100*mdm[i]/tr14[i]
+        if pdi+mdi==0: continue
+        dxs.append(abs(pdi-mdi)/(pdi+mdi)*100)
+    if len(dxs)<n: return None
+    adx=sum(dxs[-n:])/n
+    return min(round(adx,1),100)
 
 def calc_adx(p,n=14):
     if len(p)<n*2: return None
     ch=[abs(p[i]-p[i-1]) for i in range(1,len(p))]
     av=sum(ch[-n:])/n; rng=max(p[-n:])-min(p[-n:])
     return min(round((av/rng)*200,1),100) if rng else 0
+
+def calc_vwap(candles,n=20):
+    if not candles: return None
+    sub=candles[-n:] if len(candles)>=n else candles
+    vol=sum(c["volume"] for c in sub)
+    if vol>0:
+        tpv=sum((c["high"]+c["low"]+c["close"])/3*c["volume"] for c in sub)
+        return round(tpv/vol,2)
+    return round(sum((c["high"]+c["low"]+c["close"])/3 for c in sub)/len(sub),2)
 
 def calc_cci(p,n=20):
     if len(p)<n: return None
@@ -320,26 +421,24 @@ def calc_support_resistance(candles,lookback=40):
     return {"support":support,"resistance":resistance,
             "key_level":key_level,"key_level_type":key_type}
 
-def build_indicators(prices,candles=None):
-    if len(prices)<30: return {}
-    m,ms,mh=calc_macd(prices); bl,bm,bu=calc_bollinger(prices); sk,sd=calc_stoch(prices)
-    poc=vah=val=None
-    ichimoku={"tenkan":None,"kijun":None,"senkou_a":None,"senkou_b":None,"cloud_status":"—","label":"—"}
-    supres={"support":None,"resistance":None,"key_level":None,"key_level_type":"—"}
-    if candles:
-        poc,vah,val=calc_volume_profile(candles)
-        ichimoku=calc_ichimoku(candles)
-        supres=calc_support_resistance(candles)
-    return {"price":prices[-1],"ema9":calc_ema(prices,9),"ema20":calc_ema(prices,20),
-            "ema50":calc_ema(prices,50),"ema100":calc_ema(prices,100),"ema200":calc_ema(prices,200),
-            "rsi":calc_rsi(prices),"macd":m,"macd_signal":ms,"macd_hist":mh,
+def build_indicators(candles,live_price=None):
+    """Indikatoren primär auf OHLC-Kerzen (1h/4h/1d), nicht auf Tick-Liste."""
+    if not candles or len(candles)<30: return {}
+    closes=[c["close"] for c in candles]
+    price=live_price if live_price is not None else closes[-1]
+    m,ms,mh=calc_macd(closes); bl,bm,bu=calc_bollinger(closes)
+    sk,sd=calc_stoch_candles(candles)
+    poc,vah,val=calc_volume_profile(candles)
+    ichimoku=calc_ichimoku(candles); supres=calc_support_resistance(candles)
+    return {"price":price,"ema9":calc_ema(closes,9),"ema20":calc_ema(closes,20),
+            "ema50":calc_ema(closes,50),"ema100":calc_ema(closes,100),"ema200":calc_ema(closes,200),
+            "rsi":calc_rsi(closes),"macd":m,"macd_signal":ms,"macd_hist":mh,
             "bb_lower":bl,"bb_mid":bm,"bb_upper":bu,"stoch_k":sk,"stoch_d":sd,
-            "atr":calc_atr(prices),"adx":calc_adx(prices),
-            "williams_r":calc_williams_r(prices),"cci":calc_cci(prices),
-            "vwap":round(sum(prices[-20:])/20,2),
-            "momentum":calc_momentum(prices),"momentum_5":calc_momentum(prices,5),
+            "atr":calc_atr_candles(candles),"adx":calc_adx_candles(candles),
+            "williams_r":calc_williams_r(closes),"cci":calc_cci(closes),
+            "vwap":calc_vwap(candles),
+            "momentum":calc_momentum(closes),"momentum_5":calc_momentum(closes,5),
             "poc":poc,"vah":vah,"val":val,
-            # ─── NEU (Bild 4) ───
             "ichimoku":ichimoku,"support":supres.get("support"),"resistance":supres.get("resistance"),
             "key_level":supres.get("key_level"),"key_level_type":supres.get("key_level_type")}
 
@@ -410,9 +509,10 @@ def update_intermarket():
         prev_y=bot_state["yields_10y"]; bot_state["yields_10y"]=yields
         if prev_y: bot_state["yields_trend"]="STEIGEN ↑" if yields>prev_y else "FALLEN ↓"
     if len(bot_state["prices"])>5 and len(bot_state["dxy_prices"])>5:
-        gc=bot_state["prices"][-1]-bot_state["prices"][-5]
-        dc=bot_state["dxy_prices"][-1]-bot_state["dxy_prices"][-5]
-        if dc!=0: bot_state["gold_dxy_correlation"]=round(gc/abs(dc)*-0.1,2)
+        gp=[bot_state["prices"][i]-bot_state["prices"][i-1] for i in range(-4,0)]
+        dp=[bot_state["dxy_prices"][i]-bot_state["dxy_prices"][i-1] for i in range(-4,0)]
+        corr=calc_pearson_corr(gp,dp)
+        if corr is not None: bot_state["gold_dxy_correlation"]=corr
     add_log(f"Intermarket: DXY={dxy} ({bot_state['dxy_trend']}) | Yields={yields}%","INFO")
 
 # ═══════════════════════════════════════════════════════
@@ -579,18 +679,24 @@ def check_guardrails():
     week=datetime.datetime.utcnow().strftime("%Y-W%W")
     if gr["last_reset_daily"]!=today:
         gr["last_reset_daily"]=today; gr["daily_start_balance"]=da["balance"]; gr["daily_pnl_eur"]=0.0
+        gr["triggered"]=[x for x in gr.get("triggered",[]) if x!="daily_3pct"]
+        if gr.get("status")=="PAUSE_TAG": gr["status"]="OK"
     if gr["last_reset_weekly"]!=week:
         gr["last_reset_weekly"]=week; gr["weekly_start_balance"]=da["balance"]; gr["weekly_pnl_eur"]=0.0
+        gr["triggered"]=[x for x in gr.get("triggered",[]) if x!="weekly_6pct"]
+        if gr.get("status")=="PAUSE_WOCHE": gr["status"]="OK"
     if gr["daily_start_balance"]>0:
         gr["daily_drawdown_pct"]=round(max(0,(gr["daily_start_balance"]-da["balance"])/gr["daily_start_balance"]*100),2)
     if gr["weekly_start_balance"]>0:
         gr["weekly_drawdown_pct"]=round(max(0,(gr["weekly_start_balance"]-da["balance"])/gr["weekly_start_balance"]*100),2)
     if gr["daily_drawdown_pct"]>=3.0:
         gr["status"]="PAUSE_TAG"
+        if "daily_3pct" not in gr["triggered"]: gr["triggered"].append("daily_3pct")
         add_log(f"GUARDRAIL: Tagesverlust {gr['daily_drawdown_pct']:.1f}% ≥ 3% → Handel heute pausiert","WARN")
         return False
     if gr["weekly_drawdown_pct"]>=6.0:
         gr["status"]="PAUSE_WOCHE"
+        if "weekly_6pct" not in gr["triggered"]: gr["triggered"].append("weekly_6pct")
         add_log(f"GUARDRAIL: Wochenverlust {gr['weekly_drawdown_pct']:.1f}% ≥ 6% → Review erforderlich","ERROR")
         return False
     gr["status"]="OK"; return True
@@ -684,8 +790,8 @@ def strategy_macro_structure(inds,candles,macro_bias,market_structure):
     elif bias=="SHORT_BIAS" and market_structure=="TREND_DOWN" and price:
         fib=calc_fib(candles,40) if len(candles)>=40 else {}
         f38=fib.get("38.2"); f62=fib.get("61.8")
-        if f38 and f62 and f38<=price<=f62:
-            score+=5; signals.append(f"Setup A: Rally in Fib-Zone {f38}–{f62} abverkaufen")
+        if f38 and f62 and f62<=price<=f38:
+            score+=5; signals.append(f"Setup A: Rally in Fib-Zone {f62}–{f38} abverkaufen")
             direction="SELL"; setup_type="A_PULLBACK"
             if m and ms_ and m<ms_: score+=2; signals.append("MACD bearisch bestätigt")
             if r and r>45:          score+=1; signals.append(f"RSI={r} aus Rallye gesunken")
@@ -707,10 +813,10 @@ def strategy_macro_structure(inds,candles,macro_bias,market_structure):
     # ── SETUP C: Counter-Trend (Divergenz, halbe Größe) ──
     if not direction and r and price:
         if market_structure=="TREND_UP" and bias=="SHORT_BIAS" and r>72:
-            score+=3; signals.append(f"Setup C: Counter-Trend BUY↑ vs SHORT_BIAS (RSI={r}) → 0.5× Größe")
+            score+=3; signals.append(f"Setup C: Counter-Trend SELL↓ (RSI={r} überkauft) → 0.5× Größe")
             direction="SELL"; setup_type="C_COUNTER"
         elif market_structure=="TREND_DOWN" and bias=="LONG_BIAS" and r<28:
-            score+=3; signals.append(f"Setup C: Counter-Trend SELL↓ vs LONG_BIAS (RSI={r}) → 0.5× Größe")
+            score+=3; signals.append(f"Setup C: Counter-Trend BUY↑ (RSI={r} überverkauft) → 0.5× Größe")
             direction="BUY"; setup_type="C_COUNTER"
 
     # Macro-Bias Bonus
@@ -780,6 +886,7 @@ def strategy_breakout(inds,candles):
     poc=inds.get("poc")
     if poc and d=="BUY" and p and p>poc: sc+=1
     if poc and d=="SELL" and p and p<poc: sc+=1
+    bot_state["breakout_meta"]={"volume_ratio":round(vr,2) if av>0 else None}
     return {"strategy":"BREAKOUT","score":sc,"direction":d,"signals":sg}
 
 # ═══════════════════════════════════════════════════════
@@ -793,6 +900,8 @@ def check_confirmations(direction,inds,trade_type="SHORT"):
     t1h=bot_state["trends"].get("1h",""); t4h=bot_state["trends"].get("4h","")
     t1d=bot_state["trends"].get("1d",""); dxt=bot_state.get("dxy_trend","")
     yt=bot_state.get("yields_trend",""); willy=bot_state.get("willy_last")
+    smc=bot_state.get("smc",{}); smc_sc=smc.get("smc_score",0); smc_bias=smc.get("smc_bias","")
+    sent_pct=bot_state.get("sentiment",{}).get("overall_sentiment_pct",50)
     if direction=="BUY":
         all_c=[("1H Bullish","BULLISH" in t1h,f"1H: {t1h}"),
                ("4H Bullish","BULLISH" in t4h,f"4H: {t4h}"),
@@ -805,7 +914,9 @@ def check_confirmations(direction,inds,trade_type="SHORT"):
                ("Yields fallen","FALL" in yt,f"Yields: {yt}"),
                ("Momentum+",bool(mom and mom>0),f"Mom={mom}"),
                ("Stoch<80",sk is None or sk<80,f"Stoch={sk}"),
-               ("WillyAlgo BUY",bool(willy and "BUY" in willy.get("signal_type","")),"Willy: BUY")]
+               ("WillyAlgo BUY",bool(willy and "BUY" in willy.get("signal_type","")),"Willy: BUY"),
+               ("SMC bullisch",smc_sc>=1 or "BULLISH" in smc_bias,f"SMC={smc_sc}"),
+               ("Sentiment≥40",sent_pct>=40,f"Sentiment={sent_pct}%")]
     else:
         all_c=[("1H Bearish","BEARISH" in t1h,f"1H: {t1h}"),
                ("4H Bearish","BEARISH" in t4h,f"4H: {t4h}"),
@@ -818,7 +929,9 @@ def check_confirmations(direction,inds,trade_type="SHORT"):
                ("Yields steigen","STEIG" in yt,f"Yields: {yt}"),
                ("Momentum-",bool(mom and mom<0),f"Mom={mom}"),
                ("Stoch>20",sk is None or sk>20,f"Stoch={sk}"),
-               ("WillyAlgo SELL",bool(willy and "SELL" in willy.get("signal_type","")),"Willy: SELL")]
+               ("WillyAlgo SELL",bool(willy and "SELL" in willy.get("signal_type","")),"Willy: SELL"),
+               ("SMC bearisch",smc_sc<=-1 or "BEARISH" in smc_bias,f"SMC={smc_sc}"),
+               ("Sentiment≤60",sent_pct<=60,f"Sentiment={sent_pct}%")]
     passed=[(n,d) for n,ok,d in all_c if ok]
     failed=[(n,d) for n,ok,d in all_c if not ok]
     required=7 if trade_type=="LONG" else 5
@@ -861,9 +974,11 @@ def get_demo_snapshot():
     da=dict(bot_state["demo_account"]); p=bot_state.get("price"); ot=bot_state.get("open_trade")
     unreal=0.0
     if ot and p:
+        lot_rem=ot.get("lot_remaining",ot.get("lot_size",MIN_LOT))
         pts=(p-ot["entry"]) if ot["direction"]=="BUY" else (ot["entry"]-p)
-        unreal=round(pts*ot.get("lot_size",MIN_LOT)*100,2)
-    da["unrealized_pnl_eur"]=unreal; da["equity"]=round(da["balance"]+unreal,2)
+        unreal=round(pts*lot_rem*100,2)
+    da["unrealized_pnl_eur"]=unreal
+    da["equity"]=round(da["balance"]+unreal,2)
     da["free_margin"]=round(da["equity"]-da.get("margin_used",0.0),2)
     sb=da.get("starting_balance",1000) or 1000; da["return_pct"]=round((da["equity"]-sb)/sb*100,2)
     tt=da.get("total_trades",0); da["win_rate_pct"]=round(da["winning_trades"]/tt*100,1) if tt else 0.0
@@ -887,9 +1002,11 @@ def evaluate_signal(inds,candles):
         "last_updated":datetime.datetime.utcnow().strftime("%H:%M:%S")})
     bot_state["strategy_scores"]={"mean_reversion":mr["score"],"trend_follow":tf["score"],
                                    "breakout":bo["score"],"macro_structure":ms["score"]}
-    all4=[mr,tf,bo,ms]; best=max(all4,key=lambda x:x["score"])
+    all4=[mr,tf,bo,ms]
+    candidates=[s for s in all4 if s.get("direction") and s.get("score",0)>=5]
+    best=max(candidates,key=lambda x:x["score"]) if candidates else max(all4,key=lambda x:x["score"])
     bot_state["active_strategy"]=best["strategy"]
-    direction=best["direction"]; score=best["score"]
+    direction=best.get("direction"); score=best.get("score",0)
     all_sigs=mr["signals"]+tf["signals"]+bo["signals"]+ms["signals"]
     bull=[s for s in all_sigs if any(w in s.lower() for w in ["bull","buy","steigt dxy nicht","fällt dxy","positiv","über","aufwärts"])]
     bear=[s for s in all_sigs if s not in bull]
@@ -898,13 +1015,18 @@ def evaluate_signal(inds,candles):
     if tb>=2: bull.append(f"Multi-TF: {tb}/3 bullish"); score+=1
     if ts>=2: bear.append(f"Multi-TF: {ts}/3 bearish"); score+=1
     if score<5 or not direction: return "WARTEN",round(score/14*100,1),bull,bear,"WARTEN",{},[]
+    sent_pct=bot_state.get("sentiment",{}).get("overall_sentiment_pct",50)
+    if direction=="BUY" and sent_pct<35:
+        bear.append(f"Sentiment-Filter: {sent_pct}% zu bearish"); return "WARTEN",0,bull,bear,"SENTIMENT",{},[]
+    if direction=="SELL" and sent_pct>65:
+        bull.append(f"Sentiment-Filter: {sent_pct}% zu bullish"); return "WARTEN",0,bull,bear,"SENTIMENT",{},[]
     tt=determine_trade_type(inds)
     passed,failed,required=check_confirmations(direction,inds,tt)
     bot_state["confirmations"]={"passed":[p[0] for p in passed],"failed":[f[0] for f in failed],
                                  "count":len(passed),"required":required}
     if len(passed)<required:
         return "WARTEN",round(len(passed)/required*100,1),bull,bear,f"Nur {len(passed)}/{required} Conf.",{},failed
-    conf=min(round(len(passed)/12*100,1),99)
+    conf=min(round(len(passed)/14*100,1),99)
     return direction,conf,bull,bear,best["strategy"],{"passed":passed,"failed":failed},failed
 
 # ═══════════════════════════════════════════════════════
@@ -954,10 +1076,111 @@ def check_rules(signal,inds):
         if vn: violated.append(rule["avoid"])
     return violated
 
+def update_learning_accuracy():
+    """Accuracy aus abgeschlossenen Trades — nicht aus Signal-Generierung."""
+    learn=bot_state["learning"]; stats=bot_state["stats"]
+    tt=stats.get("total_trades",0)
+    learn["total"]=tt
+    learn["wins"]=stats.get("winning_trades",0)
+    learn["accuracy"]=round(learn["wins"]/tt*100,1) if tt else 0.0
+
 # ═══════════════════════════════════════════════════════
 # TRADE MANAGEMENT
 # ═══════════════════════════════════════════════════════
 MIN_HOLD_MIN=30
+
+def _trade_pts(direction,entry,exit_price):
+    return (exit_price-entry) if direction=="BUY" else (entry-exit_price)
+
+def _credit_demo_eur(eur_pnl):
+    da=bot_state["demo_account"]
+    da["balance"]=round(max(da["balance"]+eur_pnl,0.0),2)
+    da["total_pnl_eur"]=round(da["total_pnl_eur"]+eur_pnl,2)
+    da["peak_balance"]=round(max(da["peak_balance"],da["balance"]),2)
+    if da["peak_balance"]>0:
+        dd=round((da["peak_balance"]-da["balance"])/da["peak_balance"]*100,2)
+        da["max_drawdown_pct"]=round(max(da["max_drawdown_pct"],dd),2)
+    gr=bot_state["guardrails"]
+    gr["daily_pnl_eur"]=round(gr.get("daily_pnl_eur",0)+eur_pnl,2)
+    gr["weekly_pnl_eur"]=round(gr.get("weekly_pnl_eur",0)+eur_pnl,2)
+
+def _apply_partial_close(t,exit_price,tp_label,pct):
+    lot_orig=t["lot_size"]; remaining=t.get("lot_remaining",lot_orig)
+    lot_close=round(lot_orig*pct,2)
+    if tp_label=="TP3": lot_close=remaining
+    else: lot_close=min(lot_close,remaining)
+    if lot_close<MIN_LOT: return False
+    pts=_trade_pts(t["direction"],t["entry"],exit_price)
+    eur=round(pts*lot_close*100,2)
+    t["lot_remaining"]=round(remaining-lot_close,2)
+    t["realized_pnl_pts"]=round(t.get("realized_pnl_pts",0)+pts,2)
+    t["realized_eur"]=round(t.get("realized_eur",0)+eur,2)
+    t.setdefault("partial_closes",[]).append({"tp":tp_label,"lot":lot_close,"price":exit_price,"pts":round(pts,2),"eur":eur})
+    _credit_demo_eur(eur)
+    hit_key={"TP1":"tp1_hit","TP2":"tp2_hit","TP3":"tp3_hit"}[tp_label]
+    t[hit_key]=True
+    if tp_label=="TP1": t["sl"]=t["entry"]
+    add_log(f"Partial {tp_label}: {lot_close} Lot @ {exit_price} → €{eur:+.2f}"+(" | SL→Breakeven" if tp_label=="TP1" else ""),"TRADE")
+    return True
+
+def _finalize_trade(t,price,res,all_tp=False):
+    remaining=t.get("lot_remaining",t.get("lot_size",MIN_LOT))
+    hold_min=t.get("hold_min",0)
+    if res=="LOSS":
+        exit_p=t["sl"]
+        pts=_trade_pts(t["direction"],t["entry"],exit_p)-SPREAD_PTS
+        final_eur=round(pts*remaining*100,2) if remaining>=MIN_LOT else 0.0
+    else:
+        exit_p=t["tp3"] if all_tp else price
+        pts=_trade_pts(t["direction"],t["entry"],exit_p)
+        final_eur=round(pts*remaining*100,2) if remaining>=MIN_LOT else 0.0
+    total_eur=round(t.get("realized_eur",0)+final_eur,2)
+    if remaining>=MIN_LOT and final_eur: _credit_demo_eur(final_eur)
+    total_pts=round(t.get("realized_pnl_pts",0)+pts,2) if remaining>=MIN_LOT else round(t.get("realized_pnl_pts",0),2)
+    t.update({"close_price":price,"pnl":total_pts,"result":res,"eur_pnl":total_eur,
+              "hold_min_final":round(hold_min,1),"all_tp_hit":all_tp,
+              "close_time":datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+              "lot_remaining":0,"status":"CLOSED"})
+    bot_state["trades"].insert(0,{k:v for k,v in t.items() if k!="inds_at_entry"})
+    if len(bot_state["trades"])>300: bot_state["trades"].pop()
+    if res=="LOSS":
+        mist=analyze_failed_trade(t,t.get("inds_at_entry",{}))
+        if mist:
+            bot_state["learning"]["mistakes"].insert(0,{"time":datetime.datetime.utcnow().strftime("%d.%m %H:%M"),
+                "trade":f"{t['direction']} @ {t['entry']} [{t.get('strategy','')}]","mistakes":mist})
+            if len(bot_state["learning"]["mistakes"])>30: bot_state["learning"]["mistakes"].pop()
+            update_rules(mist)
+        if t.get("confirmations_passed",0)>=5:
+            bot_state["learning"]["confirmation_failures"].insert(0,{"time":datetime.datetime.utcnow().strftime("%d.%m %H:%M"),
+                "trade":f"{t['direction']} @ {t['entry']}","conf_count":t.get("confirmations_passed",0),"pnl":total_pts})
+            if len(bot_state["learning"]["confirmation_failures"])>15: bot_state["learning"]["confirmation_failures"].pop()
+    bot_state["open_trade"]=None
+    s=bot_state["stats"]; s["total_trades"]+=1; s["total_pnl"]=round(s["total_pnl"]+total_pts,2)
+    if t.get("trade_type")=="LONG": s["long_trades"]+=1
+    else: s["short_trades"]+=1
+    if res=="WIN":
+        s["winning_trades"]+=1; s["best_trade"]=round(max(s["best_trade"],total_pts),2)
+        wins=[x["pnl"] for x in bot_state["trades"] if x["result"]=="WIN"]
+        s["avg_win"]=round(sum(wins)/len(wins),2) if wins else 0
+    else:
+        s["losing_trades"]+=1; s["worst_trade"]=round(min(s["worst_trade"],total_pts),2)
+        losses=[x["pnl"] for x in bot_state["trades"] if x["result"]=="LOSS"]
+        s["avg_loss"]=round(sum(losses)/len(losses),2) if losses else 0
+    if s["total_trades"]>0: s["win_rate"]=round(s["winning_trades"]/s["total_trades"]*100,1)
+    strat_key=t.get("strategy","MEAN_REVERSION")
+    if strat_key in bot_state["strategy_stats"]:
+        ss=bot_state["strategy_stats"][strat_key]
+        ss["trades"]+=1; ss["pnl"]=round(ss["pnl"]+total_pts,2); ss["eur_pnl"]=round(ss["eur_pnl"]+total_eur,2)
+        if res=="WIN": ss["wins"]+=1; ss["best"]=round(max(ss["best"],total_pts),2)
+        else: ss["losses"]+=1; ss["worst"]=round(min(ss["worst"],total_pts),2)
+        ss["win_rate"]=round(ss["wins"]/ss["trades"]*100,1) if ss["trades"]>0 else 0.0
+    da=bot_state["demo_account"]; da["total_trades"]+=1
+    if res=="WIN": da["winning_trades"]+=1
+    else: da["losing_trades"]+=1
+    da["margin_used"]=0.0; da["leverage_used"]=0.0
+    update_performance(); update_learning_accuracy()
+    partials=len(t.get("partial_closes",[]))
+    add_log(f"Trade {res}: {t['direction']} @ {t['entry']}→{price} | {total_pts:+.2f}Pkt | €{total_eur:+.2f} | {strat_key} | {partials} Partials","TRADE")
 
 def open_trade(sig,price,atr_v,inds_snap,strategy,trade_type,passed_conf,size_mult=1.0):
     mult={"SHORT":1.5,"LONG":2.5}.get(trade_type,1.5); tp_m={"SHORT":1.5,"LONG":3.0}.get(trade_type,1.5)
@@ -971,14 +1194,16 @@ def open_trade(sig,price,atr_v,inds_snap,strategy,trade_type,passed_conf,size_mu
         add_log(f"Trade ABGELEHNT: {sizing['reason']}","LEARN"); return False
     lot=sizing["lot"]
     bot_state["open_trade"]={"direction":sig,"entry":price,"sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3,
-        "lot_size":lot,"strategy":strategy,"trade_type":trade_type,"size_multiplier":size_mult,
+        "lot_size":lot,"lot_remaining":lot,"strategy":strategy,"trade_type":trade_type,"size_multiplier":size_mult,
         "open_time":datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         "hold_min":0.0,"status":"OPEN","inds_at_entry":inds_snap,
+        "tp1_hit":False,"tp2_hit":False,"tp3_hit":False,
+        "realized_pnl_pts":0.0,"realized_eur":0.0,"partial_closes":[],
         "willy_confirmed":bot_state["willy_last"] is not None,"confirmations_passed":len(passed_conf),
         "notional":sizing["notional"],"leverage_used":sizing["leverage_used"],
         "margin_used":sizing["margin_used"],"risk_eur":sizing["risk_eur"],"risk_pct":sizing["risk_pct"]}
     da=bot_state["demo_account"]; da["margin_used"]=sizing["margin_used"]; da["leverage_used"]=sizing["leverage_used"]
-    add_log(f"{trade_type} {sig} @ {price} | SL:{sl} TP1:{tp1} TP2:{tp2} | Lot:{lot} | Hebel 1:{sizing['leverage_used']} | Risiko {sizing['risk_pct']}% (€{sizing['risk_eur']})","TRADE")
+    add_log(f"{trade_type} {sig} @ {price} | SL:{sl} TP1/2/3:{tp1}/{tp2}/{tp3} | Lot:{lot} (33/33/34%) | Risiko {sizing['risk_pct']}%","TRADE")
     return True
 
 def check_trade(price):
@@ -988,76 +1213,29 @@ def check_trade(price):
         ot=datetime.datetime.strptime(t["open_time"],"%Y-%m-%d %H:%M:%S")
         hold_min=(datetime.datetime.utcnow()-ot).total_seconds()/60; t["hold_min"]=round(hold_min,1)
     except: hold_min=999
-    res=None; pnl=0; all_tp=False
-    if t["direction"]=="BUY":
-        if price<=t["sl"]:                              res="LOSS"; pnl=round(t["sl"]-t["entry"],2)
-        elif price>=t["tp3"]:                           res="WIN";  pnl=round(t["tp3"]-t["entry"],2); all_tp=True
-        elif price>=t["tp2"] and hold_min>=MIN_HOLD_MIN: res="WIN";  pnl=round(t["tp2"]-t["entry"],2)
-        elif price>=t["tp1"] and hold_min>=MIN_HOLD_MIN: res="WIN";  pnl=round(t["tp1"]-t["entry"],2)
-    elif t["direction"]=="SELL":
-        if price>=t["sl"]:                              res="LOSS"; pnl=round(t["entry"]-t["sl"],2)
-        elif price<=t["tp3"]:                           res="WIN";  pnl=round(t["entry"]-t["tp3"],2); all_tp=True
-        elif price<=t["tp2"] and hold_min>=MIN_HOLD_MIN: res="WIN";  pnl=round(t["entry"]-t["tp2"],2)
-        elif price<=t["tp1"] and hold_min>=MIN_HOLD_MIN: res="WIN";  pnl=round(t["entry"]-t["tp1"],2)
-    if not res: return
-    lot=t.get("lot_size",MIN_LOT); eur_pnl=round(pnl*lot*100,2)
-    t.update({"close_price":price,"pnl":pnl,"result":res,"eur_pnl":eur_pnl,
-              "hold_min_final":round(hold_min,1),"all_tp_hit":all_tp,
-              "close_time":datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")})
-    bot_state["trades"].insert(0,{k:v for k,v in t.items() if k!="inds_at_entry"})
-    if len(bot_state["trades"])>300: bot_state["trades"].pop()
-    # Learning
-    if res=="LOSS":
-        mist=analyze_failed_trade(t,t.get("inds_at_entry",{}))
-        if mist:
-            bot_state["learning"]["mistakes"].insert(0,{"time":datetime.datetime.utcnow().strftime("%d.%m %H:%M"),
-                "trade":f"{t['direction']} @ {t['entry']} [{t.get('strategy','')}]","mistakes":mist})
-            if len(bot_state["learning"]["mistakes"])>30: bot_state["learning"]["mistakes"].pop()
-            update_rules(mist)
-        if t.get("confirmations_passed",0)>=5:
-            bot_state["learning"]["confirmation_failures"].insert(0,{"time":datetime.datetime.utcnow().strftime("%d.%m %H:%M"),
-                "trade":f"{t['direction']} @ {t['entry']}","conf_count":t.get("confirmations_passed",0),"pnl":pnl})
-            if len(bot_state["learning"]["confirmation_failures"])>15: bot_state["learning"]["confirmation_failures"].pop()
-    bot_state["open_trade"]=None
-    # Global Stats
-    s=bot_state["stats"]; s["total_trades"]+=1; s["total_pnl"]=round(s["total_pnl"]+pnl,2)
-    if t.get("trade_type")=="LONG": s["long_trades"]+=1
-    else: s["short_trades"]+=1
-    if res=="WIN":
-        s["winning_trades"]+=1; s["best_trade"]=round(max(s["best_trade"],pnl),2)
-        wins=[x["pnl"] for x in bot_state["trades"] if x["result"]=="WIN"]
-        s["avg_win"]=round(sum(wins)/len(wins),2) if wins else 0
-    else:
-        s["losing_trades"]+=1; s["worst_trade"]=round(min(s["worst_trade"],pnl),2)
-        losses=[x["pnl"] for x in bot_state["trades"] if x["result"]=="LOSS"]
-        s["avg_loss"]=round(sum(losses)/len(losses),2) if losses else 0
-    if s["total_trades"]>0: s["win_rate"]=round(s["winning_trades"]/s["total_trades"]*100,1)
-    # ── Pro-Strategie P&L ──
-    strat_key=t.get("strategy","MEAN_REVERSION")
-    if strat_key in bot_state["strategy_stats"]:
-        ss=bot_state["strategy_stats"][strat_key]
-        ss["trades"]+=1; ss["pnl"]=round(ss["pnl"]+pnl,2); ss["eur_pnl"]=round(ss["eur_pnl"]+eur_pnl,2)
-        if res=="WIN":
-            ss["wins"]+=1; ss["best"]=round(max(ss["best"],pnl),2)
-        else:
-            ss["losses"]+=1; ss["worst"]=round(min(ss["worst"],pnl),2)
-        ss["win_rate"]=round(ss["wins"]/ss["trades"]*100,1) if ss["trades"]>0 else 0.0
-    # Demo Konto
-    da=bot_state["demo_account"]
-    da["balance"]=round(max(da["balance"]+eur_pnl,0.0),2); da["total_trades"]+=1
-    if res=="WIN": da["winning_trades"]+=1
-    else: da["losing_trades"]+=1
-    da["total_pnl_eur"]=round(da["total_pnl_eur"]+eur_pnl,2)
-    da["peak_balance"]=round(max(da["peak_balance"],da["balance"]),2)
-    if da["peak_balance"]>0:
-        dd=round((da["peak_balance"]-da["balance"])/da["peak_balance"]*100,2)
-        da["max_drawdown_pct"]=round(max(da["max_drawdown_pct"],dd),2)
-    da["margin_used"]=0.0; da["leverage_used"]=0.0
-    # Guardrail Update
-    gr=bot_state["guardrails"]; gr["daily_pnl_eur"]=round(gr.get("daily_pnl_eur",0)+eur_pnl,2)
-    gr["weekly_pnl_eur"]=round(gr.get("weekly_pnl_eur",0)+eur_pnl,2)
-    update_performance()
-    add_log(f"Trade {res}: {t['direction']} @ {t['entry']}→{price} | {pnl:+.2f}Pkt | €{eur_pnl:+.2f} | {strat_key} | {hold_min:.0f}Min","TRADE")
+    d=t["direction"]; remaining=t.get("lot_remaining",t.get("lot_size",MIN_LOT))
+    if d=="BUY":
+        if price<=t["sl"]:
+            _finalize_trade(t,price,"LOSS"); return
+        if price>=t["tp3"]:
+            if not t.get("tp3_hit"): _apply_partial_close(t,t["tp3"],"TP3",TP_PARTIAL_PCT[2])
+            _finalize_trade(t,price,"WIN",all_tp=True); return
+        if hold_min>=MIN_HOLD_MIN:
+            if not t.get("tp1_hit") and price>=t["tp1"]:
+                _apply_partial_close(t,t["tp1"],"TP1",TP_PARTIAL_PCT[0]); return
+            if t.get("tp1_hit") and not t.get("tp2_hit") and price>=t["tp2"]:
+                _apply_partial_close(t,t["tp2"],"TP2",TP_PARTIAL_PCT[1]); return
+    elif d=="SELL":
+        if price>=t["sl"]:
+            _finalize_trade(t,price,"LOSS"); return
+        if price<=t["tp3"]:
+            if not t.get("tp3_hit"): _apply_partial_close(t,t["tp3"],"TP3",TP_PARTIAL_PCT[2])
+            _finalize_trade(t,price,"WIN",all_tp=True); return
+        if hold_min>=MIN_HOLD_MIN:
+            if not t.get("tp1_hit") and price<=t["tp1"]:
+                _apply_partial_close(t,t["tp1"],"TP1",TP_PARTIAL_PCT[0]); return
+            if t.get("tp1_hit") and not t.get("tp2_hit") and price<=t["tp2"]:
+                _apply_partial_close(t,t["tp2"],"TP2",TP_PARTIAL_PCT[1]); return
 
 # ═══════════════════════════════════════════════════════
 # HAUPTLOOP
@@ -1092,6 +1270,37 @@ def _willy_score(sig_type):
     if "C"  in s: return "C"
     return "—"
 
+def _find_willy_pending(data=None, direction=None, timeframe=None, entry_price=None):
+    """Findet das passendste offene Willy-Signal (nicht blind das erste PENDING)."""
+    wa=bot_state["willy_analytics"]
+    pending=[s for s in wa["open_signals"] if s["status"]=="PENDING"]
+    if not pending: return None
+    data=data or {}
+    sig_id=data.get("id") or data.get("signal_id")
+    if sig_id:
+        for s in pending:
+            if str(s.get("id"))==str(sig_id):
+                return s
+    dir_hint=direction or data.get("direction")
+    if dir_hint:
+        dir_hint=str(dir_hint).upper()
+        if dir_hint in ("BUY","SELL"):
+            matched=[s for s in pending if s.get("direction")==dir_hint]
+            if matched: pending=matched
+    tf=timeframe or data.get("timeframe")
+    if tf and tf!="—":
+        matched=[s for s in pending if s.get("timeframe")==tf]
+        if matched: pending=matched
+    ref_entry=entry_price
+    if ref_entry is None and data.get("entry") is not None:
+        try: ref_entry=float(str(data.get("entry")).replace(",","."))
+        except: ref_entry=None
+    if ref_entry is not None:
+        with_entry=[s for s in pending if s.get("entry") is not None]
+        if with_entry:
+            pending=sorted(with_entry,key=lambda s: abs(s["entry"]-ref_entry))
+    return pending[0] if pending else None
+
 def process_willy_signal(data):
     """Verarbeitet eingehende WillyAlgoTrader Webhooks komplett."""
     wa=bot_state["willy_analytics"]
@@ -1111,37 +1320,35 @@ def process_willy_signal(data):
     score_clean=_willy_score(sig_type)
     now_str=datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-    # ── TP-Hit: offene Signale auflösen ──
+    # ── TP-Hit: passendes offenes Signal auflösen ──
     if direction=="TP" and tp_level:
+        sig=_find_willy_pending(data,timeframe=tf if tf!="—" else None,entry_price=_safe(data.get("entry")))
+        if not sig:
+            add_log(f"Willy TP{tp_level}: kein passendes offenes Signal","WARN"); return
         wa["tp1_hits" if tp_level==1 else "tp2_hits" if tp_level==2 else "tp3_hits"]+=1
-        resolved=False
-        for sig in wa["open_signals"]:
-            if sig["status"]=="PENDING":
-                sig["status"]=f"WIN_TP{tp_level}"
-                sig["result"]="WIN"; sig["tp_level_hit"]=tp_level
-                sig["close_time"]=now_str; sig["close_price"]=entry_price
-                if entry_price and sig.get("entry"):
-                    pts=abs(entry_price-sig["entry"])
-                    sig["pips"]=round(pts,2)
-                    wa["avg_pips_win"]=round((wa["avg_pips_win"]*wa["wins"]+pts)/(wa["wins"]+1),2)
-                _close_willy_signal(sig,"WIN",tp_level)
-                resolved=True; break
-        if resolved: _recalc_willy_stats()
-        return
+        sig["status"]=f"WIN_TP{tp_level}"
+        sig["result"]="WIN"; sig["tp_level_hit"]=tp_level
+        sig["close_time"]=now_str; sig["close_price"]=entry_price
+        if entry_price and sig.get("entry"):
+            pts=abs(entry_price-sig["entry"])
+            sig["pips"]=round(pts,2)
+            wa["avg_pips_win"]=round((wa["avg_pips_win"]*wa["wins"]+pts)/(wa["wins"]+1),2)
+        _close_willy_signal(sig,"WIN",tp_level)
+        _recalc_willy_stats(); return
 
-    # ── SL-Hit: offene Signale als Verlust schließen ──
+    # ── SL-Hit: passendes offenes Signal als Verlust schließen ──
     if direction=="SL":
+        sig=_find_willy_pending(data,timeframe=tf if tf!="—" else None,entry_price=_safe(data.get("entry")))
+        if not sig:
+            add_log("Willy SL: kein passendes offenes Signal","WARN"); return
         wa["sl_hits"]+=1
-        for sig in wa["open_signals"]:
-            if sig["status"]=="PENDING":
-                sig["status"]="LOSS_SL"; sig["result"]="LOSS"
-                sig["close_time"]=now_str; sig["close_price"]=entry_price
-                if entry_price and sig.get("entry"):
-                    pts=abs(entry_price-sig["entry"])
-                    sig["pips"]=-round(pts,2)
-                    wa["avg_pips_loss"]=round((wa["avg_pips_loss"]*wa["losses"]+pts)/(wa["losses"]+1),2)
-                _close_willy_signal(sig,"LOSS",None)
-                break
+        sig["status"]="LOSS_SL"; sig["result"]="LOSS"
+        sig["close_time"]=now_str; sig["close_price"]=entry_price
+        if entry_price and sig.get("entry"):
+            pts=abs(entry_price-sig["entry"])
+            sig["pips"]=-round(pts,2)
+            wa["avg_pips_loss"]=round((wa["avg_pips_loss"]*wa["losses"]+pts)/(wa["losses"]+1),2)
+        _close_willy_signal(sig,"LOSS",None)
         _recalc_willy_stats(); return
 
     # ── Neues BUY/SELL-Signal ──
@@ -1187,7 +1394,7 @@ def _close_willy_signal(sig,result,tp_level):
             if tp_level: wa["by_tf"][tf][f"tp{tp_level}"]=wa["by_tf"][tf].get(f"tp{tp_level}",0)+1
         if sc in wa["by_score"]:
             wa["by_score"][sc]["wins"]+=1; wa["by_score"][sc]["pending"]=max(0,wa["by_score"][sc]["pending"]-1)
-    else:
+    elif result=="LOSS":
         wa["losses"]+=1
         d=wa["by_direction"].get(sig["direction"],{})
         d["losses"]=d.get("losses",0)+1; d["pending"]=max(0,d.get("pending",0)-1)
@@ -1196,6 +1403,14 @@ def _close_willy_signal(sig,result,tp_level):
             wa["by_tf"][tf]["losses"]+=1; wa["by_tf"][tf]["pending"]=max(0,wa["by_tf"][tf]["pending"]-1)
         if sc in wa["by_score"]:
             wa["by_score"][sc]["losses"]+=1; wa["by_score"][sc]["pending"]=max(0,wa["by_score"][sc]["pending"]-1)
+    elif result=="EXPIRED":
+        d=wa["by_direction"].get(sig["direction"],{})
+        d["pending"]=max(0,d.get("pending",0)-1); wa["by_direction"][sig["direction"]]=d
+        tf=sig.get("timeframe","—"); sc=sig.get("score","—")
+        if tf in wa["by_tf"]:
+            wa["by_tf"][tf]["pending"]=max(0,wa["by_tf"][tf]["pending"]-1)
+        if sc in wa["by_score"]:
+            wa["by_score"][sc]["pending"]=max(0,wa["by_score"][sc]["pending"]-1)
 
 def _recalc_willy_stats():
     """Berechnet alle Win-Rates neu."""
@@ -1256,7 +1471,9 @@ def check_willy_open_signals(price):
                 wa["sl_hits"]+=1
             to_close.append((sig,result,tp_level))
         elif result=="EXPIRED":
-            to_close.append((sig,"LOSS",None))
+            sig["result"]="EXPIRED"; sig["close_time"]=now.strftime("%Y-%m-%d %H:%M:%S")
+            sig["close_price"]=close_price; sig["pips"]=0
+            to_close.append((sig,"EXPIRED",None))
     for sig,res,tp in to_close:
         _close_willy_signal(sig,res,tp)
     if to_close:
@@ -1550,77 +1767,76 @@ def update_smc_analysis():
     add_log(f"SMC: {smc['smc_bias']} | PD:{pd.get('zone','?')} | OBs:{len(active_obs)} | LZs:{len(smc['liquidity_zones'])} | FVGs:{len(smc['fair_value_gaps'])}","INFO")
 
 def analysis_loop():
-    add_log("XAUUSD KI-Bot v4.0 — 4 Strategien, Macro-Analyse, Guardrails, Tab-Dashboard","INFO")
+    add_log("XAUUSD KI-Bot v4.1 — OHLC-Indikatoren, Partial-TP, SMC/Sentiment-Filter","INFO")
     cycle=0; c_cycle=0; i_cycle=0; w_cycle=0
     while bot_state["running"]:
         try:
-            cycle+=1; bot_state["learning"]["cycle"]=cycle; bot_state["session"]=get_session()
-            i_cycle+=1
-            if i_cycle>=6 or cycle==1: i_cycle=0; update_intermarket(); update_sentiment_analysis()
-            c_cycle+=1
-            if c_cycle>=3 or cycle==1:
-                c_cycle=0
-                for tf in ["1h","4h","1d"]:
-                    c=fetch_candles(tf,80)
-                    if c:
-                        bot_state["candles"][tf]=c; trend,det=analyze_trend(c)
-                        bot_state["trends"][tf]=trend; bot_state["trend_details"][tf]=det
-                        closes=[x["close"] for x in c]
-                        bot_state[f"indicators_{tf}"]=build_indicators(closes,c)
-                        add_log(f"TF {tf}: {trend}","INFO")
-                tl=[bot_state["trends"].get(t,"") for t in ["1h","4h","1d"]]
-                bc=sum(1 for t in tl if "BULLISH" in t); sc=sum(1 for t in tl if "BEARISH" in t)
-                bot_state["trends"]["overall"]="BULLISH ▲" if bc>=2 else "BEARISH ▼" if sc>=2 else "MIXED ↔"
-            w_cycle+=1
-            if w_cycle>=288 or cycle==1: w_cycle=0; update_weekly_analysis()
-            price=fetch_price()
-            if price:
-                bot_state["price"]=price; bot_state["prices"].append(price)
-                if len(bot_state["prices"])>500: bot_state["prices"].pop(0)
-                bot_state["last_update"]=datetime.datetime.utcnow().strftime("%H:%M:%S UTC")
-                check_trade(price)
-                check_willy_open_signals(price)
-                if len(bot_state["prices"])>=30:
+            with state_lock:
+                cycle+=1; bot_state["learning"]["cycle"]=cycle; bot_state["session"]=get_session()
+                i_cycle+=1
+                if i_cycle>=6 or cycle==1: i_cycle=0; update_intermarket(); update_sentiment_analysis()
+                c_cycle+=1
+                if c_cycle>=3 or cycle==1:
+                    c_cycle=0
+                    for tf in ["1h","4h","1d"]:
+                        c=fetch_candles(tf,80)
+                        if c:
+                            bot_state["candles"][tf]=c; trend,det=analyze_trend(c)
+                            bot_state["trends"][tf]=trend; bot_state["trend_details"][tf]=det
+                            bot_state[f"indicators_{tf}"]=build_indicators(c)
+                            bot_state["data_quality"][f"candles_{tf}"]=len(c)
+                            add_log(f"TF {tf}: {trend} ({len(c)} Kerzen)","INFO")
+                    bot_state["data_quality"]["last_candle_fetch"]=datetime.datetime.utcnow().strftime("%H:%M:%S UTC")
+                    tl=[bot_state["trends"].get(t,"") for t in ["1h","4h","1d"]]
+                    bc=sum(1 for t in tl if "BULLISH" in t); sc=sum(1 for t in tl if "BEARISH" in t)
+                    bot_state["trends"]["overall"]="BULLISH ▲" if bc>=2 else "BEARISH ▼" if sc>=2 else "MIXED ↔"
+                w_cycle+=1
+                if w_cycle>=1440 or cycle==1: w_cycle=0; update_weekly_analysis()
+                price=fetch_price()
+                if price:
+                    bot_state["price"]=price; bot_state["prices"].append(price)
+                    if len(bot_state["prices"])>500: bot_state["prices"].pop(0)
+                    bot_state["last_update"]=datetime.datetime.utcnow().strftime("%H:%M:%S UTC")
+                    check_trade(price)
+                    check_willy_open_signals(price)
                     c1h=bot_state["candles"].get("1h",[])
-                    inds=build_indicators(bot_state["prices"],c1h); bot_state["indicators"]=inds
-                    sig,conf,bull,bear,strategy,conf_data,failed=evaluate_signal(inds,c1h)
-                    bot_state["stats"]["total_signals"]+=1
-                    if sig=="BUY":  bot_state["stats"]["buy_signals"]+=1
-                    elif sig=="SELL": bot_state["stats"]["sell_signals"]+=1
-                    if sig in ["BUY","SELL"]:
-                        viol=check_rules(sig,inds)
-                        if viol:
-                            bot_state["stats"]["avoided_by_learning"]+=1
-                            bot_state["learning"]["avoided_trades"]+=1
-                            add_log(f"Signal {sig} ABGELEHNT (Lernregel): {viol[0]}","LEARN")
-                            sig="WARTEN"; conf=0
-                    tt=determine_trade_type(inds); bot_state["trade_type"]=tt
-                    atr_v=inds.get("atr") or 20
-                    passed=conf_data.get("passed",[]) if isinstance(conf_data,dict) else []
-                    size_mult=bot_state["macro_state"].get("size_multiplier",1.0) if strategy=="MACRO_STRUCTURE" else 1.0
-                    entry={"time":datetime.datetime.utcnow().strftime("%H:%M:%S"),
-                           "date":datetime.datetime.utcnow().strftime("%d.%m.%Y"),
-                           "signal":sig,"confidence":conf,"price":price,"reasons":bull,"counter_reasons":bear,
-                           "atr":atr_v,"strategy":strategy,"trade_type":tt,
-                           "sl":round(price-1.5*atr_v,2) if sig=="BUY" else round(price+1.5*atr_v,2) if sig=="SELL" else None,
-                           "tp1":round(price+1.5*atr_v,2) if sig=="BUY" else round(price-1.5*atr_v,2) if sig=="SELL" else None,
-                           "tp2":round(price+3.0*atr_v,2) if sig=="BUY" else round(price-3.0*atr_v,2) if sig=="SELL" else None,
-                           "confirmations_passed":len(passed),"willy_confirmed":bot_state["willy_last"] is not None,
-                           "session":bot_state["session"],"dxy":bot_state.get("dxy"),"yields":bot_state.get("yields_10y")}
-                    bot_state["last_signal"]=entry; bot_state["signals"].insert(0,entry)
-                    if len(bot_state["signals"])>500: bot_state["signals"].pop()
-                    if sig!="WARTEN" and not bot_state["open_trade"]:
-                        open_trade(sig,price,atr_v,dict(inds),strategy,tt,passed,size_mult)
-                    bot_state["learning"]["total"]+=1
-                    if sig in ["BUY","SELL"]: bot_state["learning"]["wins"]+=1
-                    t2=bot_state["learning"]["total"]
-                    bot_state["learning"]["accuracy"]=round(bot_state["learning"]["wins"]/t2*100,1) if t2>0 else 0
-                    add_log(f"{sig} [{strategy}] {tt} | {conf}% | {price} | Conf:{len(passed)}/{bot_state['confirmations'].get('required',5)} | {bot_state['session']}","SIGNAL" if sig!="WARTEN" else "INFO")
-                else:
-                    add_log(f"Preis:{price} | Sammle Daten ({len(bot_state['prices'])}/30)","INFO")
+                    if len(c1h)>=30:
+                        inds=build_indicators(c1h,live_price=price); bot_state["indicators"]=inds
+                        update_smc_analysis()
+                        sig,conf,bull,bear,strategy,conf_data,failed=evaluate_signal(inds,c1h)
+                        bot_state["stats"]["total_signals"]+=1
+                        if sig=="BUY":  bot_state["stats"]["buy_signals"]+=1
+                        elif sig=="SELL": bot_state["stats"]["sell_signals"]+=1
+                        if sig in ["BUY","SELL"]:
+                            viol=check_rules(sig,inds)
+                            if viol:
+                                bot_state["stats"]["avoided_by_learning"]+=1
+                                bot_state["learning"]["avoided_trades"]+=1
+                                add_log(f"Signal {sig} ABGELEHNT (Lernregel): {viol[0]}","LEARN")
+                                sig="WARTEN"; conf=0
+                        tt=determine_trade_type(inds); bot_state["trade_type"]=tt
+                        atr_v=inds.get("atr") or 20
+                        passed=conf_data.get("passed",[]) if isinstance(conf_data,dict) else []
+                        size_mult=bot_state["macro_state"].get("size_multiplier",1.0) if strategy=="MACRO_STRUCTURE" else 1.0
+                        entry={"time":datetime.datetime.utcnow().strftime("%H:%M:%S"),
+                               "date":datetime.datetime.utcnow().strftime("%d.%m.%Y"),
+                               "signal":sig,"confidence":conf,"price":price,"reasons":bull,"counter_reasons":bear,
+                               "atr":atr_v,"strategy":strategy,"trade_type":tt,
+                               "sl":round(price-1.5*atr_v,2) if sig=="BUY" else round(price+1.5*atr_v,2) if sig=="SELL" else None,
+                               "tp1":round(price+1.5*atr_v,2) if sig=="BUY" else round(price-1.5*atr_v,2) if sig=="SELL" else None,
+                               "tp2":round(price+3.0*atr_v,2) if sig=="BUY" else round(price-3.0*atr_v,2) if sig=="SELL" else None,
+                               "confirmations_passed":len(passed),"willy_confirmed":bot_state["willy_last"] is not None,
+                               "session":bot_state["session"],"dxy":bot_state.get("dxy"),"yields":bot_state.get("yields_10y")}
+                        bot_state["last_signal"]=entry; bot_state["signals"].insert(0,entry)
+                        if len(bot_state["signals"])>500: bot_state["signals"].pop()
+                        if sig!="WARTEN" and not bot_state["open_trade"]:
+                            open_trade(sig,price,atr_v,dict(inds),strategy,tt,passed,size_mult)
+                        add_log(f"{sig} [{strategy}] {tt} | {conf}% | {price} | Conf:{len(passed)}/{bot_state['confirmations'].get('required',5)} | {bot_state['session']}","SIGNAL" if sig!="WARTEN" else "INFO")
+                    else:
+                        add_log(f"Preis:{price} | Warte auf Kerzen ({len(c1h)}/30)","INFO")
         except Exception as e:
             add_log(f"Loop-Fehler: {e}","ERROR")
-        time.sleep(300)
+        time.sleep(LOOP_INTERVAL_SEC)
 
 # ═══════════════════════════════════════════════════════
 # DASHBOARD v4.0 — 5 Tabs (Gesamt + 4 Strategien)
@@ -1739,6 +1955,7 @@ td{padding:7px 8px;border-bottom:1px solid #0d1420;font-variant-numeric:tabular-
     <span class="b bb" id="clk">—</span>
     <span class="b ba" id="sess-b">—</span>
     <span class="b ba" id="last-upd">Warte...</span>
+    <span class="b br" id="stale-b" style="display:none">STALE</span>
     <span class="b bp" id="willy-b">WILLY: —</span>
     <span class="b bc" id="gr-status">GUARDRAIL: OK</span>
   </div>
@@ -1755,6 +1972,7 @@ td{padding:7px 8px;border-bottom:1px solid #0d1420;font-variant-numeric:tabular-
   <button class="tab tab-ms"        onclick="showTab('t-ms',this)">🟣 Macro Struktur</button>
   <button class="tab"               onclick="showTab('t-willy',this)" style="border-color:#f59e0b">⭐ WillyAlgoTrader</button>
   <button class="tab"               onclick="showTab('t-sent',this)" style="border-color:#2dd4bf">🌐 Sentiment &amp; Makro</button>
+  <button class="tab"               onclick="showTab('t-smc',this)" style="border-color:#a78bfa">🏦 SMC / Institutionell</button>
   <button class="tab tab-st"        onclick="showTab('t-stats',this)">📈 Statistiken</button>
 </div>
 
@@ -2278,6 +2496,39 @@ td{padding:7px 8px;border-bottom:1px solid #0d1420;font-variant-numeric:tabular-
 </div><!-- /t-sent -->
 
 <!-- ══════════════════════════════════════
+     TAB: SMC / INSTITUTIONELL
+══════════════════════════════════════ -->
+<div id="t-smc" class="tc">
+<div class="sec">Smart Money Concepts — Order Blocks, Liquidität, FVG, BOS/CHoCH</div>
+<div class="g4" style="margin-bottom:12px">
+  <div class="dk"><div class="lbl">SMC Bias</div><div class="dv" id="smc-bias">—</div></div>
+  <div class="dk"><div class="lbl">SMC Score</div><div class="dv" id="smc-score">0</div></div>
+  <div class="dk"><div class="lbl">Premium / Discount</div><div class="dv" id="smc-pd" style="font-size:14px">—</div></div>
+  <div class="dk"><div class="lbl">Struktur</div><div class="dv" id="smc-struct" style="font-size:14px">—</div></div>
+</div>
+<div class="g2" style="margin-bottom:12px">
+  <div class="pn">
+    <div class="pt"><span class="dot dp"></span>Order Blocks &amp; Liquidität</div>
+    <div class="row"><span class="rk">Nächster Order Block</span><span class="rv" id="smc-ob">—</span></div>
+    <div class="row"><span class="rk">Nächste Liquiditätszone</span><span class="rv" id="smc-lz">—</span></div>
+    <div class="row"><span class="rk">BOS / CHoCH</span><span class="rv" id="smc-bos">—</span></div>
+    <div style="margin-top:10px;font-size:12px;color:var(--dm);line-height:1.8" id="smc-obs">—</div>
+  </div>
+  <div class="pn">
+    <div class="pt"><span class="dot da"></span>Fair Value Gaps &amp; Institutionelle Moves</div>
+    <div id="smc-fvgs" style="font-size:12.5px;color:var(--am);line-height:1.9;margin-bottom:10px">—</div>
+    <div class="lbl">INSTITUTIONELLE MUSTER</div>
+    <div id="smc-moves" style="font-size:12.5px;color:var(--dm);line-height:1.9">—</div>
+  </div>
+</div>
+<div class="pn">
+  <div class="pt"><span class="dot db"></span>Liquiditätszonen (Top 6)</div>
+  <div id="smc-lzs" style="font-size:12.5px;line-height:2">—</div>
+  <div class="meta" id="smc-upd" style="margin-top:8px">—</div>
+</div>
+</div><!-- /t-smc -->
+
+<!-- ══════════════════════════════════════
      TAB: STATISTIKEN
 ══════════════════════════════════════ -->
 <div id="t-stats" class="tc">
@@ -2318,6 +2569,7 @@ td{padding:7px 8px;border-bottom:1px solid #0d1420;font-variant-numeric:tabular-
   </div>
   <div class="pn">
     <div class="pt"><span class="dot dp"></span>Lernmodul</div>
+    <div class="row"><span class="rk">Trade-Accuracy</span><span class="rv" id="l-acc">—</span></div>
     <div class="lbl">AKTIVE REGELN (ab 2× Fehler)</div>
     <div id="l-rules" style="font-size:13px;color:var(--pu);line-height:1.9;margin-top:4px">—</div>
     <div style="border-top:1px solid var(--bd);margin-top:10px;padding-top:8px">
@@ -2393,7 +2645,10 @@ async function refresh(){
 
     // ── Header ──
     document.getElementById('clk').textContent=new Date().toUTCString().slice(17,25)+' UTC';
-    document.getElementById('last-upd').textContent=d.last_update||'Warte...';
+    document.getElementById('last-upd').textContent=(d.last_update||'Warte...')+(d.price_stale?' (Cache)':'');
+    const staleEl=document.getElementById('stale-b');
+    if(d.price_stale){staleEl.style.display='inline-block';staleEl.textContent='PREIS CACHE';}
+    else staleEl.style.display='none';
     document.getElementById('sess-b').textContent=d.session||'—';
     const grEl=document.getElementById('gr-status');
     grEl.textContent='GUARDRAIL: '+(gr.status||'OK');
@@ -2497,12 +2752,15 @@ async function refresh(){
     // Open Trade
     const ot=d.open_trade;
     if(ot){
+      const lotRem=ot.lot_remaining!=null?ot.lot_remaining:ot.lot_size;
       const upnl=ot.direction==='BUY'?(p||0)-ot.entry:ot.entry-(p||0);
-      const upE=upnl*(ot.lot_size||0.01)*100;
+      const upE=upnl*(lotRem||0.01)*100;
+      const partials=(ot.partial_closes||[]).map(x=>x.tp+':'+x.eur+'€').join(' · ');
       document.getElementById('open-trade').innerHTML=
         `<span class="${ot.direction==='BUY'?'pos':'neg'}" style="font-weight:700">[${ot.trade_type||''}] ${ot.direction}</span>`+
         ` @ ${ot.entry} · SL ${ot.sl} · TP1 ${ot.tp1} · TP2 ${ot.tp2} · TP3 ${ot.tp3||'—'}<br>`+
-        `Lot ${ot.lot_size||'—'} · Hebel 1:${ot.leverage_used||'—'} · ${ot.risk_pct||'—'}% (€${ot.risk_eur||'—'}) · ${ot.strategy||'—'}<br>`+
+        `Lot ${lotRem}/${ot.lot_size||'—'} offen · Realisiert: €${(ot.realized_eur||0).toFixed(2)} · ${ot.strategy||'—'}<br>`+
+        `${partials?`Partials: ${partials}<br>`:''}`+
         `Gehalten: ${ot.hold_min||0} Min · Conf: ${ot.confirmations_passed||0} · `+
         `Unrealisiert: <span class="${upnl>=0?'pos':'neg'}">${upnl>=0?'+':''}${upnl.toFixed(2)} Pkt (${upE>=0?'+':''}${upE.toFixed(2)}€)</span>`;
     } else document.getElementById('open-trade').textContent='Kein offener Trade';
@@ -2696,7 +2954,7 @@ async function refresh(){
     document.getElementById('bo-best').textContent=(bo.best||0).toFixed(2);
     document.getElementById('bo-worst').textContent=(bo.worst||0).toFixed(2);
     document.getElementById('bo-sess').textContent=d.session||'—';
-    document.getElementById('bo-vol').textContent='—';
+    document.getElementById('bo-vol').textContent=d.breakout_meta&&d.breakout_meta.volume_ratio!=null?d.breakout_meta.volume_ratio+'× Ø':'—';
     document.getElementById('bo-poc').textContent=fmt(i.poc);
     document.getElementById('bo-sigs').innerHTML=
       (trades.filter(t=>t.strategy==='BREAKOUT').slice(0,3).map(t=>
@@ -2772,6 +3030,7 @@ async function refresh(){
     document.getElementById('mom').textContent=`${fmt(i.momentum)} / ${fmt(i.momentum_5)}`;
 
     const rules=learn.rules||[],cfl=learn.confirmation_failures||[];
+    document.getElementById('l-acc').textContent=learn.total?`${learn.accuracy||0}% (${learn.wins||0}/${learn.total})`:'—';
     document.getElementById('l-rules').innerHTML=rules.length
       ?rules.slice(0,6).map(r=>`⚡ [${r.count}×] ${r.avoid}`).join('<br>'):'Noch keine Regeln...';
     document.getElementById('l-conf-fail').innerHTML=cfl.length
@@ -2880,6 +3139,32 @@ async function refresh(){
       }).join('')
       :'—';
 
+    // ── TAB: SMC ──
+    const smc=d.smc||{}; const boc=smc.bos_choch||{}; const pd=smc.premium_discount||{};
+    const smcBiasEl=document.getElementById('smc-bias');
+    smcBiasEl.textContent=smc.smc_bias||'—';
+    smcBiasEl.className='dv '+tc(smc.smc_bias||'');
+    document.getElementById('smc-score').textContent=smc.smc_score!=null?((smc.smc_score>=0?'+':'')+smc.smc_score):'0';
+    document.getElementById('smc-pd').textContent=pd.zone||'—';
+    document.getElementById('smc-struct').textContent=boc.structure||'—';
+    const nob=smc.nearest_ob;
+    document.getElementById('smc-ob').textContent=nob?nob.label||`${nob.type} @ ${nob.mid}`:'—';
+    const nlz=smc.nearest_lz;
+    document.getElementById('smc-lz').textContent=nlz?nlz.label||String(nlz.level):'—';
+    const bos=boc.bos, cho=boc.choch;
+    document.getElementById('smc-bos').textContent=[bos&&bos.label,cho&&cho.label].filter(Boolean).join(' · ')||'—';
+    document.getElementById('smc-obs').innerHTML=(smc.order_blocks||[]).slice(0,5).map(o=>
+      `<div>→ ${o.label||o.type} <span class="meta">(${o.strength||'?'}%)</span></div>`).join('')||'Keine Order Blocks erkannt';
+    document.getElementById('smc-fvgs').innerHTML=(smc.fair_value_gaps||[]).slice(0,5).map(f=>
+      `<div>→ ${f.label||f.type}</div>`).join('')||'Keine offenen FVGs';
+    document.getElementById('smc-moves').innerHTML=(smc.institutional_moves||[]).slice(0,5).map(m=>
+      `<div>→ ${m.label||m.type}</div>`).join('')||'—';
+    document.getElementById('smc-lzs').innerHTML=(smc.liquidity_zones||[]).slice(0,6).map(z=>
+      `<div class="row" style="padding:4px 0"><span class="rk">${z.type||'?'}</span><span class="rv">${z.label||z.level} · ${z.dist_pct||'?'}%</span></div>`
+    ).join('')||'—';
+    document.getElementById('smc-upd').textContent='Aktualisiert: '+(smc.last_updated||'—')+' · Kerzen 1h/4h/1d: '+
+      [d.data_quality&&d.data_quality.candles_1h,d.data_quality&&d.data_quality.candles_4h,d.data_quality&&d.data_quality.candles_1d].join(' / ');
+
   }catch(e){console.error('Refresh-Fehler:',e);}
   setTimeout(refresh,10000);
 }
@@ -2897,8 +3182,11 @@ def dashboard(): return render_template_string(DASHBOARD)
 
 @app.route("/state")
 def state():
-    return jsonify({
-        "price":bot_state["price"],"price_source":bot_state["price_source"],
+    with state_lock:
+        return jsonify({
+        "price":bot_state["price"],"price_stale":bot_state.get("price_stale",False),
+        "price_source":bot_state["price_source"],"data_quality":bot_state.get("data_quality",{}),
+        "breakout_meta":bot_state.get("breakout_meta",{}),
         "last_update":bot_state["last_update"],"last_signal":bot_state["last_signal"],
         "indicators":bot_state["indicators"],
         "indicators_1h":bot_state["indicators_1h"],"indicators_4h":bot_state["indicators_4h"],"indicators_1d":bot_state["indicators_1d"],
@@ -2921,7 +3209,13 @@ def state():
         "demo_account":get_demo_snapshot(),
         "willy_analytics":bot_state["willy_analytics"],
         "sentiment":bot_state["sentiment"],
+        "smc":bot_state["smc"],
     })
+
+@app.route("/smc")
+def smc_r():
+    with state_lock:
+        return jsonify(bot_state["smc"])
 
 @app.route("/trades")
 def trades(): return jsonify(bot_state["trades"])
@@ -3019,7 +3313,7 @@ def webhook():
         add_log(f"Webhook Fehler: {e}","ERROR"); return jsonify({"status":"error"}),400
 
 @app.route("/health")
-def health(): return jsonify({"status":"healthy","version":"4.0","time":datetime.datetime.utcnow().isoformat()})
+def health(): return jsonify({"status":"healthy","version":"4.1","time":datetime.datetime.utcnow().isoformat()})
 @app.route("/start")
 def start():
     if not bot_state["running"]:
