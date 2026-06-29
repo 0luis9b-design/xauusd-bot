@@ -20,7 +20,7 @@ def _def_strat_stats():
 bot_state = {
     "price":None,"price_stale":False,"prices":[],"price_source":"XAUUSD Spot (Yahoo Finance ~ OANDA Referenzpreis)",
     "data_quality":{"candles_1h":0,"candles_4h":0,"candles_1d":0,"last_candle_fetch":"—"},
-    "breakout_meta":{"volume_ratio":null},
+    "breakout_meta":{"volume_ratio":None},
     "candles":{},
     "dxy":None,"dxy_prices":[],"dxy_prev":None,"dxy_trend":"—",
     "yields_10y":None,"yields_prev":None,"yields_trend":"—",
