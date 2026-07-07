@@ -133,6 +133,24 @@ bot_state = {
         },
         "last_updated":"—",
     },
+    # ─── NEU: Daily/Weekly/Monthly Bias-System (9 Faktoren) ───
+    # Faktoren: Real Yields (FRED DFII10), DXY, EMA200, MACD, RSI, Momentum,
+    # Seasonality, COT-Proxy, WillyAlgoTrader-Signal.
+    "bias_analysis":{
+        "daily":  {"bias":"NEUTRAL","score":0,"confidence":0.0,"factors":{},"notes":[],"updated":"—"},
+        "weekly": {"bias":"NEUTRAL","score":0,"confidence":0.0,"factors":{},"notes":[],"updated":"—"},
+        "monthly":{"bias":"NEUTRAL","score":0,"confidence":0.0,"factors":{},"notes":[],"updated":"—"},
+        "real_yields_dfii10":None,"real_yields_dfii10_prev":None,"real_yields_dfii10_trend":"—",
+        "last_updated":"—",
+    },
+    # ─── NEU: Bias-vs-Trade Win-Rate Tracking ───
+    "bias_trade_stats":{
+        "daily":  {"aligned":0,"aligned_wins":0,"counter":0,"counter_wins":0,"aligned_win_rate":0.0,"counter_win_rate":0.0},
+        "weekly": {"aligned":0,"aligned_wins":0,"counter":0,"counter_wins":0,"aligned_win_rate":0.0,"counter_win_rate":0.0},
+        "monthly":{"aligned":0,"aligned_wins":0,"counter":0,"counter_wins":0,"aligned_win_rate":0.0,"counter_win_rate":0.0},
+    },
+    # ─── NEU: Forex Factory Wirtschaftskalender (nfs.faireconomy.media) ───
+    "ff_events":[], "ff_last_fetch":"—", "ff_fetch_status":"—",
 }
 
 def add_log(msg,level="INFO"):
@@ -225,7 +243,7 @@ def fetch_candles(interval="1h",count=80):
             raw=_parse_yahoo_candles(yahoo_fetch("XAUUSD%3DX","1h","60d"))
             agg=aggregate_candles(raw,4)
             return agg[-count:] if len(agg)>count else agg
-        mp={"1h":("1h","30d"),"1d":("1d","365d")}
+        mp={"1h":("1h","30d"),"1d":("1d","365d"),"1wk":("1wk","5y"),"1mo":("1mo","max")}
         yi,yr=mp.get(interval,("1h","30d"))
         raw=_parse_yahoo_candles(yahoo_fetch("XAUUSD%3DX",yi,yr))
         return raw[-count:] if len(raw)>count else raw
@@ -656,6 +674,195 @@ def update_sentiment_analysis():
     add_log(f"Sentiment: {sent['overall_sentiment_label']} ({score}%) | Real Yields Proxy:{ry} | Fed:{fed.get('status')}","INFO")
 
 # ═══════════════════════════════════════════════════════
+# NEU: DAILY/WEEKLY/MONTHLY BIAS-SYSTEM (9 Faktoren)
+# ═══════════════════════════════════════════════════════
+# Faktoren: Real Yields (FRED DFII10), DXY, EMA200, MACD, RSI, Momentum,
+# Saisonalität, CoT-Proxy, WillyAlgoTrader-Signal. Jeder Faktor trägt -1/0/+1 bei
+# (Saisonalität gewichtet, siehe unten). Score-Bereich ≈ -9…+9.
+_MONTH_DE={1:"Januar",2:"Februar",3:"März",4:"April",5:"Mai",6:"Juni",7:"Juli",8:"August",
+           9:"September",10:"Oktober",11:"November",12:"Dezember"}
+
+def calc_seasonality_score(month=None):
+    """
+    Historische saisonale Tendenz für Gold (grobe, mehrjährige Durchschnitts-Heuristik,
+    KEINE Garantie für das laufende Jahr — dient nur als schwacher Zusatzfaktor).
+    Skala: -2 (stark bärisch) … +2 (stark bullisch)
+    """
+    m=month or datetime.datetime.utcnow().month
+    table={1:1,2:0,3:-1,4:1,5:-1,6:0,7:-1,8:1,9:2,10:1,11:2,12:1}
+    return table.get(m,0)
+
+def fetch_fred_real_yields():
+    """
+    US 10Y Real Yields (FRED-Serie DFII10) — frei zugänglich ohne API-Key über den
+    CSV-Graph-Export. Best-effort: bei Fehler bleibt der zuletzt bekannte Wert erhalten.
+    """
+    url="https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFII10"
+    try:
+        req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
+        with urllib.request.urlopen(req,timeout=10) as r:
+            txt=r.read().decode("utf-8",errors="ignore")
+        rows=[l.strip() for l in txt.splitlines() if l.strip()]
+        for line in reversed(rows[1:] if len(rows)>1 else []):
+            parts=line.split(",")
+            if len(parts)>=2:
+                val=parts[1].strip()
+                if val not in (".","",None):
+                    try: return round(float(val),2)
+                    except: continue
+        return None
+    except Exception as e:
+        add_log(f"FRED DFII10-Abruf fehlgeschlagen (best-effort): {e}","WARN")
+        return None
+
+def update_real_yields_dfii10():
+    ba=bot_state["bias_analysis"]
+    val=fetch_fred_real_yields()
+    if val is not None:
+        prev=ba.get("real_yields_dfii10")
+        ba["real_yields_dfii10_prev"]=prev; ba["real_yields_dfii10"]=val
+        if prev is not None:
+            ba["real_yields_dfii10_trend"]="FALLEND (bullisch)" if val<prev else "STEIGEND (bärisch)" if val>prev else "UNVERÄNDERT"
+        add_log(f"FRED Real Yields (DFII10): {val}% ({ba['real_yields_dfii10_trend']})","INFO")
+
+def calc_timeframe_bias(timeframe):
+    """Berechnet den Bias für 'daily'/'weekly'/'monthly' aus 9 Faktoren."""
+    tf_map={"daily":"1d","weekly":"1wk","monthly":"1mo"}
+    candles=bot_state["candles"].get(tf_map.get(timeframe,"1d"),[])
+    factors={}; notes=[]
+    if len(candles)>=30:
+        closes=[c["close"] for c in candles]
+        ema=calc_ema(closes,200)
+        if ema is not None:
+            f=1 if closes[-1]>ema else -1
+            notes.append(f"EMA200: Preis {'>' if f>0 else '<'} EMA200 → {'bullisch' if f>0 else 'bärisch'}")
+        else: f=0
+        factors["ema200"]=f
+        m,ms,mh=calc_macd(closes)
+        if m is not None and ms is not None:
+            f=1 if m>ms else -1 if m<ms else 0
+            if f!=0: notes.append(f"MACD {'>' if f>0 else '<'} Signal → {'bullisch' if f>0 else 'bärisch'}")
+        else: f=0
+        factors["macd"]=f
+        r=calc_rsi(closes)
+        if r is not None:
+            f=1 if r>55 else -1 if r<45 else 0
+            if f!=0: notes.append(f"RSI={r} → {'bullisch' if f>0 else 'bärisch'}")
+        else: f=0
+        factors["rsi"]=f
+        mom=calc_momentum(closes)
+        if mom is not None:
+            f=1 if mom>0 else -1 if mom<0 else 0
+            if f!=0: notes.append(f"Momentum={mom:+.1f} → {'bullisch' if f>0 else 'bärisch'}")
+        else: f=0
+        factors["momentum"]=f
+    else:
+        factors.update({"ema200":0,"macd":0,"rsi":0,"momentum":0})
+        notes.append(f"Zu wenig {timeframe}-Kerzen ({len(candles)}) für Preis-Faktoren")
+
+    ry_trend=bot_state["bias_analysis"].get("real_yields_dfii10_trend","—")
+    factors["real_yields"]=1 if "FALLEND" in ry_trend else -1 if "STEIGEND" in ry_trend else 0
+    if factors["real_yields"]!=0: notes.append(f"Real Yields (DFII10): {ry_trend}")
+
+    dxt=bot_state.get("dxy_trend","—")
+    factors["dxy"]=1 if "FÄLLT" in dxt else -1 if "STEIGT" in dxt else 0
+    if factors["dxy"]!=0: notes.append(f"DXY {dxt}")
+
+    seas=calc_seasonality_score()
+    seas_w={"daily":0.25,"weekly":0.5,"monthly":1.0}.get(timeframe,0.5)
+    factors["seasonality"]=round(seas*seas_w,2)
+    if seas!=0: notes.append(f"Saisonalität ({_MONTH_DE.get(datetime.datetime.utcnow().month)}): {seas:+d} (Gewicht ×{seas_w})")
+
+    cot=bot_state["sentiment"].get("cot_report",{}).get("net_long_pct")
+    factors["cot"]=1 if (cot is not None and cot>=65) else -1 if (cot is not None and cot<=35) else 0
+    if factors["cot"]!=0: notes.append(f"CoT {cot}% Netto-Long")
+
+    willy=bot_state.get("willy_last")
+    wd=(willy or {}).get("signal_type","")
+    factors["willy"]=1 if "BUY" in wd else -1 if "SELL" in wd else 0
+    if factors["willy"]!=0: notes.append(f"WillyAlgoTrader: {wd}")
+
+    score=round(sum(factors.values()),2)
+    if score>=4:         bias="STARK BULLISCH 🟢"
+    elif score>=1.5:     bias="BULLISCH"
+    elif score<=-4:      bias="STARK BEARISH 🔴"
+    elif score<=-1.5:    bias="BEARISH"
+    else:                bias="NEUTRAL ⚪"
+    confidence=round(min(abs(score)/9*100,100),1)
+    return {"bias":bias,"score":score,"confidence":confidence,"factors":factors,"notes":notes[:9],
+            "updated":datetime.datetime.utcnow().strftime("%H:%M:%S UTC")}
+
+def update_bias_analysis():
+    ba=bot_state["bias_analysis"]
+    for tf in ("daily","weekly","monthly"):
+        result=calc_timeframe_bias(tf)
+        ba[tf].update(result)
+    ba["last_updated"]=datetime.datetime.utcnow().strftime("%H:%M:%S UTC")
+    add_log(f"Bias: Daily={ba['daily']['bias']} | Weekly={ba['weekly']['bias']} | Monthly={ba['monthly']['bias']}","INFO")
+
+def update_bias_trade_stats(trade,result):
+    """Vergleicht einen abgeschlossenen Trade mit dem Daily/Weekly/Monthly-Bias bei Eröffnung."""
+    bts=bot_state["bias_trade_stats"]; bae=trade.get("bias_at_entry") or {}
+    direction=trade.get("direction")
+    for tf in ("daily","weekly","monthly"):
+        score=bae.get(tf,0)
+        if abs(score)<1.5: continue  # Bias war neutral → kein Alignment-Vergleich sinnvoll
+        bias_dir="BUY" if score>0 else "SELL"
+        stat=bts[tf]
+        if direction==bias_dir:
+            stat["aligned"]+=1
+            if result=="WIN": stat["aligned_wins"]+=1
+        else:
+            stat["counter"]+=1
+            if result=="WIN": stat["counter_wins"]+=1
+        stat["aligned_win_rate"]=round(stat["aligned_wins"]/stat["aligned"]*100,1) if stat["aligned"] else 0.0
+        stat["counter_win_rate"]=round(stat["counter_wins"]/stat["counter"]*100,1) if stat["counter"] else 0.0
+
+# ═══════════════════════════════════════════════════════
+# NEU: FOREX FACTORY WIRTSCHAFTSKALENDER (nfs.faireconomy.media)
+# ═══════════════════════════════════════════════════════
+def fetch_forex_factory_events():
+    """
+    Forex-Factory-Wochenkalender, kostenlos ohne API-Key. Liefert die Termine der
+    aktuellen Woche. Bei Fehler: None (alte Events bleiben aktiv, kein Absturz).
+    """
+    url="https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+    try:
+        req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
+        with urllib.request.urlopen(req,timeout=10) as r:
+            data=json.loads(r.read().decode("utf-8",errors="ignore"))
+        out=[]
+        for ev in data:
+            try:
+                cur=ev.get("country") or ev.get("currency") or ""
+                impact=str(ev.get("impact","")).upper()
+                title=ev.get("title") or ev.get("event") or "Event"
+                date_raw=ev.get("date")
+                if not date_raw: continue
+                dt=datetime.datetime.fromisoformat(str(date_raw).replace("Z","+00:00"))
+                dt_utc=dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+                if cur not in ("USD","ALL","All") and "gold" not in title.lower(): continue
+                out.append({"name":f"{title} ({cur})","time":dt_utc.strftime("%Y-%m-%d %H:%M"),
+                            "impact":impact or "MEDIUM","currency":cur,
+                            "forecast":ev.get("forecast",""),"previous":ev.get("previous",""),
+                            "actual":ev.get("actual","")})
+            except: continue
+        return out
+    except Exception as e:
+        add_log(f"Forex-Factory-Abruf fehlgeschlagen (best-effort): {e}","WARN")
+        return None
+
+def update_forex_factory():
+    events=fetch_forex_factory_events()
+    if events is not None:
+        bot_state["ff_events"]=events
+        bot_state["ff_last_fetch"]=datetime.datetime.utcnow().strftime("%d.%m.%Y %H:%M UTC")
+        bot_state["ff_fetch_status"]=f"OK ({len(events)} Events)"
+        add_log(f"Forex Factory: {len(events)} Events geladen","INFO")
+    else:
+        bot_state["ff_fetch_status"]="Fehler — letzte bekannte Events bleiben aktiv"
+
+# ═══════════════════════════════════════════════════════
 # NEWS-SPERRE
 # ═══════════════════════════════════════════════════════
 def check_news_lock():
@@ -666,6 +873,16 @@ def check_news_lock():
             if abs((now-et).total_seconds()/60)<=30:
                 bot_state["news_lock"]=True
                 bot_state["news_lock_reason"]=f"News-Sperre: {ev['name']} (±30 Min)"
+                return True
+        except: continue
+    # NEU: Forex-Factory High-Impact-Events zusätzlich prüfen
+    for ev in bot_state.get("ff_events",[]):
+        if ev.get("impact")!="HIGH": continue
+        try:
+            et=datetime.datetime.strptime(ev["time"],"%Y-%m-%d %H:%M")
+            if abs((now-et).total_seconds()/60)<=30:
+                bot_state["news_lock"]=True
+                bot_state["news_lock_reason"]=f"News-Sperre (Forex Factory): {ev['name']} (±30 Min)"
                 return True
         except: continue
     bot_state["news_lock"]=False; bot_state["news_lock_reason"]=""; return False
@@ -1178,7 +1395,7 @@ def _finalize_trade(t,price,res,all_tp=False):
     if res=="WIN": da["winning_trades"]+=1
     else: da["losing_trades"]+=1
     da["margin_used"]=0.0; da["leverage_used"]=0.0
-    update_performance(); update_learning_accuracy()
+    update_performance(); update_learning_accuracy(); update_bias_trade_stats(t,res)
     partials=len(t.get("partial_closes",[]))
     add_log(f"Trade {res}: {t['direction']} @ {t['entry']}→{price} | {total_pts:+.2f}Pkt | €{total_eur:+.2f} | {strat_key} | {partials} Partials","TRADE")
 
@@ -1201,7 +1418,8 @@ def open_trade(sig,price,atr_v,inds_snap,strategy,trade_type,passed_conf,size_mu
         "realized_pnl_pts":0.0,"realized_eur":0.0,"partial_closes":[],
         "willy_confirmed":bot_state["willy_last"] is not None,"confirmations_passed":len(passed_conf),
         "notional":sizing["notional"],"leverage_used":sizing["leverage_used"],
-        "margin_used":sizing["margin_used"],"risk_eur":sizing["risk_eur"],"risk_pct":sizing["risk_pct"]}
+        "margin_used":sizing["margin_used"],"risk_eur":sizing["risk_eur"],"risk_pct":sizing["risk_pct"],
+        "bias_at_entry":{tf:bot_state["bias_analysis"][tf]["score"] for tf in ("daily","weekly","monthly")}}
     da=bot_state["demo_account"]; da["margin_used"]=sizing["margin_used"]; da["leverage_used"]=sizing["leverage_used"]
     add_log(f"{trade_type} {sig} @ {price} | SL:{sl} TP1/2/3:{tp1}/{tp2}/{tp3} | Lot:{lot} (33/33/34%) | Risiko {sizing['risk_pct']}%","TRADE")
     return True
@@ -1768,7 +1986,7 @@ def update_smc_analysis():
 
 def analysis_loop():
     add_log("XAUUSD KI-Bot v4.1 — OHLC-Indikatoren, Partial-TP, SMC/Sentiment-Filter","INFO")
-    cycle=0; c_cycle=0; i_cycle=0; w_cycle=0
+    cycle=0; c_cycle=0; i_cycle=0; w_cycle=0; b_cycle=0
     while bot_state["running"]:
         try:
             with state_lock:
@@ -1790,8 +2008,19 @@ def analysis_loop():
                     tl=[bot_state["trends"].get(t,"") for t in ["1h","4h","1d"]]
                     bc=sum(1 for t in tl if "BULLISH" in t); sc=sum(1 for t in tl if "BEARISH" in t)
                     bot_state["trends"]["overall"]="BULLISH ▲" if bc>=2 else "BEARISH ▼" if sc>=2 else "MIXED ↔"
+                    update_bias_analysis()  # NEU: Bias neu berechnen, sobald frische 1d-Kerzen da sind
                 w_cycle+=1
                 if w_cycle>=1440 or cycle==1: w_cycle=0; update_weekly_analysis()
+                # NEU: Weekly/Monthly-Kerzen, FRED Real Yields & Forex Factory — seltener (~stündlich)
+                b_cycle+=1
+                if b_cycle>=60 or cycle==1:
+                    b_cycle=0
+                    for tf in ["1wk","1mo"]:
+                        c=fetch_candles(tf,250)
+                        if c: bot_state["candles"][tf]=c
+                    update_real_yields_dfii10()
+                    update_forex_factory()
+                    update_bias_analysis()
                 price=fetch_price()
                 if price:
                     bot_state["price"]=price; bot_state["prices"].append(price)
@@ -1973,6 +2202,7 @@ td{padding:7px 8px;border-bottom:1px solid #0d1420;font-variant-numeric:tabular-
   <button class="tab"               onclick="showTab('t-willy',this)" style="border-color:#f59e0b">⭐ WillyAlgoTrader</button>
   <button class="tab"               onclick="showTab('t-sent',this)" style="border-color:#2dd4bf">🌐 Sentiment &amp; Makro</button>
   <button class="tab"               onclick="showTab('t-smc',this)" style="border-color:#a78bfa">🏦 SMC / Institutionell</button>
+  <button class="tab"               onclick="showTab('t-bias',this)" style="border-color:#22d3ee">🧭 Bias &amp; Forex Factory</button>
   <button class="tab tab-st"        onclick="showTab('t-stats',this)">📈 Statistiken</button>
 </div>
 
@@ -2527,6 +2757,60 @@ td{padding:7px 8px;border-bottom:1px solid #0d1420;font-variant-numeric:tabular-
   <div class="meta" id="smc-upd" style="margin-top:8px">—</div>
 </div>
 </div><!-- /t-smc -->
+
+<!-- ══════════════════════════════════════
+     TAB: BIAS & FOREX FACTORY (NEU)
+══════════════════════════════════════ -->
+<div id="t-bias" class="tc">
+<div class="sec">🧭 Daily/Weekly/Monthly Bias-System — 9 Faktoren (Real Yields DFII10, DXY, EMA200, MACD, RSI, Momentum, Saisonalität, CoT, WillyAlgoTrader)</div>
+<div class="g3" style="margin-bottom:12px">
+  <div class="pn">
+    <div class="pt"><span class="dot dc"></span>Daily Bias</div>
+    <div class="big" id="bias-daily-label">—</div>
+    <div class="meta">Score <b id="bias-daily-score">—</b> · Konfidenz <b id="bias-daily-conf">—</b></div>
+    <div class="pb"><div class="pf pg" id="bias-daily-bar" style="width:50%"></div></div>
+    <div id="bias-daily-notes" style="font-size:12px;color:var(--dm);line-height:1.7;margin-top:8px">—</div>
+    <div class="meta" id="bias-daily-upd" style="margin-top:6px">—</div>
+  </div>
+  <div class="pn">
+    <div class="pt"><span class="dot dc"></span>Weekly Bias</div>
+    <div class="big" id="bias-weekly-label">—</div>
+    <div class="meta">Score <b id="bias-weekly-score">—</b> · Konfidenz <b id="bias-weekly-conf">—</b></div>
+    <div class="pb"><div class="pf pg" id="bias-weekly-bar" style="width:50%"></div></div>
+    <div id="bias-weekly-notes" style="font-size:12px;color:var(--dm);line-height:1.7;margin-top:8px">—</div>
+    <div class="meta" id="bias-weekly-upd" style="margin-top:6px">—</div>
+  </div>
+  <div class="pn">
+    <div class="pt"><span class="dot dc"></span>Monthly Bias</div>
+    <div class="big" id="bias-monthly-label">—</div>
+    <div class="meta">Score <b id="bias-monthly-score">—</b> · Konfidenz <b id="bias-monthly-conf">—</b></div>
+    <div class="pb"><div class="pf pg" id="bias-monthly-bar" style="width:50%"></div></div>
+    <div id="bias-monthly-notes" style="font-size:12px;color:var(--dm);line-height:1.7;margin-top:8px">—</div>
+    <div class="meta" id="bias-monthly-upd" style="margin-top:6px">—</div>
+  </div>
+</div>
+
+<div class="sec">Bias-vs-Trade Win-Rate — im Einklang mit dem Bias vs. gegen den Bias</div>
+<div class="pn" style="margin-bottom:12px">
+  <div class="tw">
+  <table>
+    <thead><tr><th>Timeframe</th><th>Aligned Trades</th><th>Aligned Win-Rate</th><th>Counter Trades</th><th>Counter Win-Rate</th></tr></thead>
+    <tbody id="bias-trade-stats-body"><tr><td colspan="5" style="text-align:center;padding:10px;color:var(--ft)">Noch keine Trades</td></tr></tbody>
+  </table>
+  </div>
+</div>
+
+<div class="sec">📅 Forex Factory — Wirtschaftskalender (USD &amp; Gold-relevante Events)</div>
+<div class="pn">
+  <div class="meta" id="ff-status" style="margin-bottom:8px">—</div>
+  <div class="tw" style="max-height:320px;overflow-y:auto">
+  <table>
+    <thead><tr><th>Zeit (UTC)</th><th>Event</th><th>Impact</th><th>Forecast</th><th>Previous</th><th>Actual</th></tr></thead>
+    <tbody id="ff-events-body"><tr><td colspan="6" style="text-align:center;padding:10px;color:var(--ft)">Noch keine Events geladen</td></tr></tbody>
+  </table>
+  </div>
+</div>
+</div><!-- /t-bias -->
 
 <!-- ══════════════════════════════════════
      TAB: STATISTIKEN
@@ -3165,6 +3449,41 @@ async function refresh(){
     document.getElementById('smc-upd').textContent='Aktualisiert: '+(smc.last_updated||'—')+' · Kerzen 1h/4h/1d: '+
       [d.data_quality&&d.data_quality.candles_1h,d.data_quality&&d.data_quality.candles_4h,d.data_quality&&d.data_quality.candles_1d].join(' / ');
 
+    // ── TAB: BIAS & FOREX FACTORY ──
+    const bias=d.bias_analysis||{};
+    for(const tf of ['daily','weekly','monthly']){
+      const bt=bias[tf]||{};
+      const lbl=document.getElementById(`bias-${tf}-label`);
+      lbl.textContent=bt.bias||'—';
+      lbl.className='big '+(bt.bias&&bt.bias.includes('BULLISCH')?'pos':bt.bias&&bt.bias.includes('BEARISH')?'neg':'neu');
+      document.getElementById(`bias-${tf}-score`).textContent=bt.score!=null?((bt.score>=0?'+':'')+bt.score):'—';
+      document.getElementById(`bias-${tf}-conf`).textContent=bt.confidence!=null?bt.confidence+'%':'—';
+      const barPct=bt.score!=null?Math.min(Math.abs(bt.score)/9*100,100):0;
+      const barEl=document.getElementById(`bias-${tf}-bar`);
+      barEl.style.width=barPct+'%';
+      barEl.className='pf '+(bt.score>0?'pg':bt.score<0?'pr':'pa');
+      document.getElementById(`bias-${tf}-notes`).innerHTML=(bt.notes||[]).map(n=>`→ ${n}`).join('<br>')||'Noch keine Begründungen';
+      document.getElementById(`bias-${tf}-upd`).textContent='Aktualisiert: '+(bt.updated||'—');
+    }
+    const bts=d.bias_trade_stats||{};
+    const btsRows=['daily','weekly','monthly'].map(tf=>{
+      const v=bts[tf]||{};
+      return `<tr><td style="text-transform:capitalize">${tf}</td>`+
+        `<td>${v.aligned||0}</td><td class="${(v.aligned_win_rate||0)>=50?'pos':'neg'}">${v.aligned_win_rate||0}%</td>`+
+        `<td>${v.counter||0}</td><td class="${(v.counter_win_rate||0)>=50?'pos':'neg'}">${v.counter_win_rate||0}%</td></tr>`;
+    }).join('');
+    document.getElementById('bias-trade-stats-body').innerHTML=btsRows||'<tr><td colspan="5" style="text-align:center;padding:10px;color:var(--ft)">Noch keine Trades</td></tr>';
+
+    const ffEvents=d.ff_events||[];
+    document.getElementById('ff-status').textContent=`Status: ${d.ff_fetch_status||'—'} · Letzter Abruf: ${d.ff_last_fetch||'—'}`;
+    document.getElementById('ff-events-body').innerHTML=ffEvents.length
+      ?ffEvents.slice(0,30).map(ev=>`<tr>
+        <td>${ev.time||'—'}</td><td>${ev.name||'—'}</td>
+        <td class="${ev.impact==='HIGH'?'neg':ev.impact==='MEDIUM'?'amr':'neu'}" style="font-weight:700">${ev.impact||'—'}</td>
+        <td>${ev.forecast||'—'}</td><td>${ev.previous||'—'}</td><td>${ev.actual||'—'}</td>
+      </tr>`).join('')
+      :'<tr><td colspan="6" style="text-align:center;padding:10px;color:var(--ft)">Noch keine Events geladen</td></tr>';
+
   }catch(e){console.error('Refresh-Fehler:',e);}
   setTimeout(refresh,10000);
 }
@@ -3210,6 +3529,9 @@ def state():
         "willy_analytics":bot_state["willy_analytics"],
         "sentiment":bot_state["sentiment"],
         "smc":bot_state["smc"],
+        "bias_analysis":bot_state["bias_analysis"],
+        "bias_trade_stats":bot_state["bias_trade_stats"],
+        "ff_events":bot_state["ff_events"],"ff_last_fetch":bot_state["ff_last_fetch"],"ff_fetch_status":bot_state["ff_fetch_status"],
     })
 
 @app.route("/smc")
@@ -3231,6 +3553,10 @@ def demo_r(): return jsonify(get_demo_snapshot())
 def macro_r(): return jsonify(bot_state["macro_state"])
 @app.route("/guardrails")
 def guardrails_r(): return jsonify(bot_state["guardrails"])
+@app.route("/bias")
+def bias_r(): return jsonify({"bias_analysis":bot_state["bias_analysis"],"bias_trade_stats":bot_state["bias_trade_stats"]})
+@app.route("/forexfactory")
+def forexfactory_r(): return jsonify({"events":bot_state["ff_events"],"last_fetch":bot_state["ff_last_fetch"],"status":bot_state["ff_fetch_status"]})
 
 @app.route("/sentiment",methods=["GET"])
 def sentiment_get(): return jsonify(bot_state["sentiment"])
